@@ -5,7 +5,7 @@
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
-		"build": "vite build",
+		"build": "vite build && node scripts/prepare-webdir.mjs",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
@@ -44,6 +44,8 @@
 		"@capacitor/app": "^8.1.0",
 		"@capacitor/barcode-scanner": "^3.0.2",
 		"@capacitor/core": "^8.3.1",
-		"@supabase/supabase-js": "^2.104.1"
+		"@supabase/supabase-js": "^2.104.1",
+		"@sveltejs/adapter-node": "^5.5.4",
+		"cheerio": "^1.2.0"
 	}
 }

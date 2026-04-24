@@ -40,3 +40,22 @@ npm run build
 You can preview the production build with `npm run preview`.
 
 > To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+
+## Environment Variables
+
+Create a local `.env` file from `.env.example` and fill in your Supabase, OpenRouter, and verify API values.
+
+The important one for the barcode scan error is `VITE_VERIFY_API_URL`. The app uses that URL for scan and vote requests instead of assuming a local SvelteKit server exists inside Capacitor.
+
+Example:
+
+```sh
+VITE_VERIFY_API_URL=https://your-backend.example.com/api/verify
+```
+
+After changing any `VITE_` value, rebuild the app so the new env value is baked into the web bundle:
+
+```sh
+npm run build
+npx cap sync android
+```

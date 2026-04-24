@@ -2,30 +2,16 @@
   import { onMount } from "svelte";
   import { CapacitorBarcodeScanner } from "@capacitor/barcode-scanner";
   import { App } from "@capacitor/app";
-  import { verifyBarcode } from "$lib/supabase";
+  import VerificationCard from "$lib/components/VerificationCard.svelte";
+  import { submitBarcodeVote, verifyBarcode } from "$lib/supabase";
+  import type { VerificationResult, VoteAction } from "$lib/verification";
 
   let isScanning = $state(false);
   let manualInput = $state("");
-  
-  type ScanResultType = {
-      status: string;
-      source: string;
-      reason: string;
-      productName: string;
-      brandName?: string;
-      imageUrl?: string;
-      category?: string;
-      ingredients?: string;
-      nutriScore?: string;
-      novaGroup?: string;
-      ecoScore?: string;
-      ingredientsAnalysis?: string[];
-      nutrientLevels?: Record<string, string>;
-  } | null;
-
   let scanResult = $state<string | null>(null);
-  let evaluation = $state<ScanResultType>(null);
-  let currentAction = $state<"idle" | "scanning" | "checking">("idle");
+  let evaluation = $state<VerificationResult | null>(null);
+  let currentAction = $state<"idle" | "scanning" | "checking" | "voting">("idle");
+  let errorMessage = $state<string | null>(null);
 
   onMount(() => {
     const backBtnListener = App.addListener("backButton", () => {
@@ -45,10 +31,43 @@
   const triggerVerification = async (barcode: string) => {
     if (!barcode) return;
     currentAction = "checking";
+    errorMessage = null;
     scanResult = barcode;
     evaluation = null;
-    evaluation = await verifyBarcode(barcode);
-    currentAction = "idle";
+    try {
+      evaluation = await verifyBarcode(barcode);
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : "Verification failed.";
+      evaluation = null;
+    } finally {
+      currentAction = "idle";
+    }
+  };
+
+  const handleVote = async (voteAction: VoteAction, result: VerificationResult) => {
+    if (!scanResult) return;
+
+    currentAction = "voting";
+    errorMessage = null;
+
+    const targetIsIsraeli = voteAction === "verify" ? result.is_israeli : !result.is_israeli;
+
+    try {
+      evaluation = await submitBarcodeVote({
+        barcode: scanResult,
+        voteAction,
+        is_israeli: targetIsIsraeli,
+        name: result.name,
+        brand: result.brand,
+        context_text: result.context_text,
+        reasoning: result.reasoning,
+        confidence: result.confidence
+      });
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : "Vote submission failed.";
+    } finally {
+      currentAction = "idle";
+    }
   };
 
   const startScan = async () => {
@@ -86,6 +105,7 @@
     scanResult = null;
     manualInput = "";
     currentAction = "idle";
+    errorMessage = null;
   };
 </script>
 
@@ -137,124 +157,25 @@
         </form>
       </div>
 
+        {#if errorMessage}
+          <div class="rounded-3xl border border-rose-400/50 bg-rose-950/70 px-4 py-3 text-sm text-rose-100">
+            {errorMessage}
+          </div>
+        {/if}
+
       {#if currentAction === "checking"}
         <div class="grid place-items-center rounded-3xl border border-slate-700/70 bg-slate-900/90 px-4 py-10 text-center shadow-[0_18px_45px_rgba(0,0,0,0.32)]">
           <div class="h-10 w-10 animate-spin rounded-full border-2 border-slate-700 border-t-amber-300"></div>
-          <p class="mt-4 text-sm text-slate-300">Analyzing product origins and nutrition data...</p>
+            <p class="mt-4 text-sm text-slate-300">Scraping search context and asking the model to reason about ownership...</p>
         </div>
-      {:else if evaluation && scanResult}
-        <article class="overflow-hidden rounded-3xl border border-slate-700/70 bg-slate-900/95 shadow-[0_22px_50px_rgba(0,0,0,0.36)] backdrop-blur">
-          <div
-            class={`h-1 w-full ${
-              evaluation.status === "israeli"
-                ? "bg-rose-500"
-                : evaluation.status === "safe"
-                  ? "bg-emerald-400"
-                  : "bg-slate-700"
-            }`}
-          ></div>
-
-          <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 px-4 py-3">
-            <span
-              class={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-widest ${
-                evaluation.status === "israeli"
-                  ? "border-rose-400 bg-rose-950 text-rose-300"
-                  : evaluation.status === "safe"
-                    ? "border-emerald-400 bg-emerald-950 text-emerald-300"
-                    : "border-slate-600 bg-slate-800 text-slate-300"
-              }`}
-            >
-              {evaluation.status === "israeli"
-                ? "Restricted"
-                : evaluation.status === "safe"
-                  ? "Verified Safe"
-                  : evaluation.status === "error"
-                    ? "Error"
-                    : "Unknown"}
-            </span>
-            <span class="max-w-full break-all text-[11px] uppercase tracking-widest text-slate-500">
-              {evaluation.source}
-            </span>
-          </div>
-
-          <div class="space-y-4 px-4 py-4">
-            <div class="space-y-1">
-              <h2 class="wrap-break-word font-[Fraunces,serif] text-3xl leading-[1.05] text-slate-100">{evaluation.productName}</h2>
-              {#if evaluation.brandName && evaluation.brandName !== "N/A" && evaluation.brandName !== "UNKNOWN BRAND"}
-                <p class="wrap-break-word text-xs uppercase tracking-[0.16em] text-amber-300">{evaluation.brandName}</p>
-              {/if}
-              <p class="text-xs text-slate-400">
-                Barcode:
-                <span class="break-all font-mono text-[11px] text-slate-300">{scanResult}</span>
-              </p>
-            </div>
-
-            <p class="rounded-2xl border border-slate-800 bg-slate-950/90 px-3 py-2.5 text-sm leading-relaxed text-slate-300">
-              {evaluation.reason}
-            </p>
-
-            <div class="grid grid-cols-3 gap-2">
-              <div class="min-w-0 rounded-2xl border border-slate-800 bg-slate-950/90 p-2 text-center">
-                <p class="truncate text-[10px] uppercase tracking-[0.12em] text-slate-500">Nutri</p>
-                <p class="wrap-break-word font-[Fraunces,serif] text-[1.35rem] leading-none text-slate-100">{evaluation.nutriScore || "N/A"}</p>
-              </div>
-              <div class="min-w-0 rounded-2xl border border-slate-800 bg-slate-950/90 p-2 text-center">
-                <p class="truncate text-[10px] uppercase tracking-[0.12em] text-slate-500">NOVA</p>
-                <p class="wrap-break-word font-[Fraunces,serif] text-[1.35rem] leading-none text-slate-100">{evaluation.novaGroup || "N/A"}</p>
-              </div>
-              <div class="min-w-0 rounded-2xl border border-slate-800 bg-slate-950/90 p-2 text-center">
-                <p class="truncate text-[10px] uppercase tracking-[0.12em] text-slate-500">Eco</p>
-                <p class="wrap-break-word font-[Fraunces,serif] text-[1.35rem] leading-none text-slate-100">{evaluation.ecoScore || "N/A"}</p>
-              </div>
-            </div>
-
-            {#if evaluation.nutrientLevels && Object.keys(evaluation.nutrientLevels).length > 0}
-              <section class="space-y-2">
-                <h3 class="text-xs uppercase tracking-[0.16em] text-slate-500">Nutrient Levels</h3>
-                <div class="space-y-2">
-                  {#each Object.entries(evaluation.nutrientLevels) as [nutrient, level] (nutrient)}
-                    <div class="flex min-w-0 items-center justify-between gap-2 rounded-xl border border-slate-800 bg-slate-950/90 px-3 py-2 text-sm">
-                      <span class="min-w-0 flex-1 truncate capitalize text-slate-300">{nutrient.replace("-", " ")}</span>
-                      <span
-                        class={`shrink-0 rounded-full px-2 py-0.5 text-xs uppercase ${
-                          level === "high"
-                            ? "bg-rose-950 text-rose-300"
-                            : level === "moderate"
-                              ? "bg-amber-950 text-amber-300"
-                              : level === "low"
-                                ? "bg-emerald-950 text-emerald-300"
-                                : "bg-slate-800 text-slate-300"
-                        }`}
-                      >
-                        {level}
-                      </span>
-                    </div>
-                  {/each}
-                </div>
-              </section>
-            {/if}
-
-            {#if evaluation.ingredientsAnalysis && evaluation.ingredientsAnalysis.length > 0}
-              <section class="space-y-2">
-                <h3 class="text-xs uppercase tracking-[0.16em] text-slate-500">Ingredients Analysis</h3>
-                <div class="flex flex-wrap gap-2">
-                  {#each evaluation.ingredientsAnalysis as tag (tag)}
-                    <span class="max-w-full wrap-break-word rounded-full border border-slate-700 bg-slate-950/90 px-2.5 py-1 text-xs text-slate-300">
-                      {tag.replace("en:", "").replaceAll("-", " ")}
-                    </span>
-                  {/each}
-                </div>
-              </section>
-            {/if}
-
-            <button
-              class="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm font-medium text-slate-100 transition active:scale-[0.99]"
-              onclick={reset}
-            >
-              Scan Another
-            </button>
-          </div>
-        </article>
+        {:else if evaluation}
+          <VerificationCard result={evaluation} voting={currentAction === "voting"} onVote={handleVote} />
+          <button
+            class="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm font-medium text-slate-100 transition active:scale-[0.99]"
+            onclick={reset}
+          >
+            Scan Another
+          </button>
       {/if}
     </div>
   </section>
