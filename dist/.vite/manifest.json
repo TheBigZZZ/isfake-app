@@ -1,6 +1,6 @@
 {
   ".svelte-kit/generated/client-optimized/app.js": {
-    "file": "_app/immutable/entry/app.37HcinJb.js",
+    "file": "_app/immutable/entry/app.JYSmFlZa.js",
     "name": "entry/app",
     "src": ".svelte-kit/generated/client-optimized/app.js",
     "isEntry": true,
@@ -16,7 +16,7 @@
     ]
   },
   ".svelte-kit/generated/client-optimized/nodes/0.js": {
-    "file": "_app/immutable/nodes/0.BFcfXOc9.js",
+    "file": "_app/immutable/nodes/0.BQ6ilhyE.js",
     "name": "nodes/0",
     "src": ".svelte-kit/generated/client-optimized/nodes/0.js",
     "isEntry": true,
@@ -26,22 +26,22 @@
       "_DXLwiZ0H.js"
     ],
     "css": [
-      "_app/immutable/assets/0.De8R7cnt.css"
+      "_app/immutable/assets/0.BFGBPLar.css"
     ]
   },
   ".svelte-kit/generated/client-optimized/nodes/1.js": {
-    "file": "_app/immutable/nodes/1.flv6p_St.js",
+    "file": "_app/immutable/nodes/1.D1mL0RJy.js",
     "name": "nodes/1",
     "src": ".svelte-kit/generated/client-optimized/nodes/1.js",
     "isEntry": true,
     "imports": [
-      "_CpE-Fom4.js",
+      "_Jn8eoOM2.js",
       "_CzTzyPtj.js",
       "_DXLwiZ0H.js"
     ]
   },
   ".svelte-kit/generated/client-optimized/nodes/2.js": {
-    "file": "_app/immutable/nodes/2.D3oioiDu.js",
+    "file": "_app/immutable/nodes/2.CqYVV3D_.js",
     "name": "nodes/2",
     "src": ".svelte-kit/generated/client-optimized/nodes/2.js",
     "isEntry": true,
@@ -65,13 +65,6 @@
     "file": "_app/immutable/chunks/ByPWl-Qi.js",
     "name": "chunk"
   },
-  "_CpE-Fom4.js": {
-    "file": "_app/immutable/chunks/CpE-Fom4.js",
-    "name": "client",
-    "imports": [
-      "_CzTzyPtj.js"
-    ]
-  },
   "_CzTzyPtj.js": {
     "file": "_app/immutable/chunks/CzTzyPtj.js",
     "name": "index-client",
@@ -94,6 +87,13 @@
       "_ByPWl-Qi.js"
     ]
   },
+  "_Jn8eoOM2.js": {
+    "file": "_app/immutable/chunks/Jn8eoOM2.js",
+    "name": "client",
+    "imports": [
+      "_CzTzyPtj.js"
+    ]
+  },
   "node_modules/@capacitor/app/dist/esm/web.js": {
     "file": "_app/immutable/chunks/CTorldvV.js",
     "name": "web",
@@ -114,12 +114,12 @@
     ]
   },
   "node_modules/@sveltejs/kit/src/runtime/client/entry.js": {
-    "file": "_app/immutable/entry/start.CIy0iXLS.js",
+    "file": "_app/immutable/entry/start.dMY6jpB9.js",
     "name": "entry/start",
     "src": "node_modules/@sveltejs/kit/src/runtime/client/entry.js",
     "isEntry": true,
     "imports": [
-      "_CpE-Fom4.js"
+      "_Jn8eoOM2.js"
     ]
   }
 }
