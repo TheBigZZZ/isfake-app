@@ -93,8 +93,9 @@ export const GET: RequestHandler = async ({ request }) => {
 	);
 };
 
-function normalizeText(value: string | null | undefined) {
-	return (value ?? '').replace(/\s+/g, ' ').trim();
+function normalizeText(value: unknown) {
+	if (value === null || value === undefined) return '';
+	return String(value).replace(/\s+/g, ' ').trim();
 }
 
 function buildScrapeHeaders() {
