@@ -65,8 +65,8 @@
 	{@const origin = getNestedOrigin(result)}
 	{@const corp = getNestedCorp(result)}
 	{@const compliance = getNestedCompliance(result)}
-	<article class={`overflow-hidden rounded-2xl border ${tone.wrap}`}>
-		<div class={`h-1 w-full ${tone.bar}`}></div>
+	<article class={`overflow-hidden rounded-2xl border ${tone.wrap} anim-in`}>
+		<div class={`h-1 w-full ${tone.bar} anim-line-soft`}></div>
 
 		<div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-700 px-4 py-3">
 			<span class={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] ${tone.pill}`}>

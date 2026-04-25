@@ -20,3 +20,61 @@
 .app-shell {
 	background: #0b1220;
 }
+
+@keyframes fade-in-up {
+	from {
+		opacity: 0;
+		transform: translateY(8px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+@keyframes pulse-soft {
+	0%,
+	100% {
+		opacity: 0.8;
+	}
+	50% {
+		opacity: 1;
+	}
+}
+
+@keyframes line-soft {
+	0%,
+	100% {
+		opacity: 0.65;
+		transform: scaleX(0.96);
+	}
+	50% {
+		opacity: 1;
+		transform: scaleX(1);
+	}
+}
+
+@layer utilities {
+	.anim-in {
+		animation: fade-in-up 0.35s ease both;
+	}
+
+	.anim-in-1 {
+		animation: fade-in-up 0.42s ease both;
+		animation-delay: 70ms;
+	}
+
+	.anim-in-2 {
+		animation: fade-in-up 0.48s ease both;
+		animation-delay: 120ms;
+	}
+
+	.anim-pulse-soft {
+		animation: pulse-soft 2.2s ease-in-out infinite;
+	}
+
+	.anim-line-soft {
+		transform-origin: left center;
+		animation: line-soft 2.8s ease-in-out infinite;
+	}
+}
