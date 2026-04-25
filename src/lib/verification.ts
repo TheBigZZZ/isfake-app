@@ -5,7 +5,12 @@ export type VerificationResult = {
 		brand: string;
 		verified_brand: string;
 		category: string;
+		confidence?: number;
 		confidence_score: number;
+	};
+	origin_data?: {
+		physical_origin: string;
+		legal_prefix_country: string;
 	};
 	origin_details?: {
 		physical_origin_country: string;
@@ -16,9 +21,16 @@ export type VerificationResult = {
 		ultimate_parent_company: string;
 		global_hq_country: string;
 	};
+	corporate_hierarchy?: {
+		immediate_owner?: string;
+		ultimate_parent: string;
+		parent_hq_country: string;
+		ownership_chain: string;
+	};
 	compliance?: {
 		is_flagged: boolean;
 		flag_reason: string | null;
+		reason?: string | null;
 	};
 	ownership_structure?: {
 		manufacturer: string;
