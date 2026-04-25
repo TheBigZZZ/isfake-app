@@ -21,6 +21,18 @@ type OpenFoodFactsProduct = {
 
 type OpenRouterCorporateOutput = {
 	barcode: string;
+	product?: {
+		name: string;
+		brand: string;
+		category: string;
+		confidence: number;
+	};
+	corporate_hierarchy?: {
+		immediate_owner: string;
+		ultimate_parent: string;
+		parent_hq_country: string;
+		ownership_chain: string;
+	};
 	product_identity: {
 		verified_name: string;
 		brand: string;
@@ -214,7 +226,7 @@ function detectLikelyDomain(text: string): 'food' | 'electronics' | 'unknown' {
 function domainToCategory(domain: 'food' | 'electronics' | 'unknown') {
 	if (domain === 'food') return 'Beverage/Food';
 	if (domain === 'electronics') return 'Electronics';
-	return 'Unknown';
+	return 'Unresolved Category';
 }
 
 function hasDirectEvidenceForFlag(reason: string) {
@@ -234,14 +246,14 @@ function hasDirectEvidenceForFlag(reason: string) {
 function getGs1RegistrationPrefix(barcode: string) {
 	const digits = normalizeText(barcode).replace(/\D/g, '');
 	if (digits.length >= 3) return digits.slice(0, 3);
-	return 'UNKNOWN';
+	return 'Unresolved Prefix';
 }
 
 function extractPhysicalOriginFromContext(contextText: string) {
 	const normalized = normalizeText(contextText);
 	const match = normalized.match(/made\s+in\s+([A-Za-z][A-Za-z\s-]{1,40})/i);
-	if (!match?.[1]) return 'UNKNOWN';
-	return normalizeText(match[1].replace(/[.,;:].*$/, '')) || 'UNKNOWN';
+	if (!match?.[1]) return 'Unresolved Origin';
+	return normalizeText(match[1].replace(/[.,;:].*$/, '')) || 'Unresolved Origin';
 }
 
 function buildScrapeHeaders() {
@@ -277,12 +289,12 @@ function extractJsonObject(rawText: string) {
 
 function buildOpenFoodFactsContext(product: OpenFoodFactsProduct) {
 	return [
-		`OFF product_name: ${normalizeText(product.product_name) || 'UNKNOWN'}`,
-		`OFF brand(s): ${normalizeText(product.brands) || normalizeText(product.brand_owner) || 'UNKNOWN'}`,
-		`OFF generic_name: ${normalizeText(product.generic_name) || 'UNKNOWN'}`,
-		`OFF categories: ${normalizeText(product.categories) || 'UNKNOWN'}`,
-		`OFF countries: ${normalizeText(product.countries) || 'UNKNOWN'}`,
-		`OFF ingredients_text: ${normalizeText(product.ingredients_text) || 'UNKNOWN'}`
+		`OFF product_name: ${normalizeText(product.product_name) || 'Unresolved Product'}`,
+		`OFF brand(s): ${normalizeText(product.brands) || normalizeText(product.brand_owner) || 'Unresolved Brand'}`,
+		`OFF generic_name: ${normalizeText(product.generic_name) || 'Unresolved Product Type'}`,
+		`OFF categories: ${normalizeText(product.categories) || 'Unresolved Category'}`,
+		`OFF countries: ${normalizeText(product.countries) || 'Unresolved Origin'}`,
+		`OFF ingredients_text: ${normalizeText(product.ingredients_text) || 'Unresolved Ingredients'}`
 	].join('\n');
 }
 
@@ -345,53 +357,54 @@ async function semanticGoogleScrape(barcode: string) {
 
 function fallbackCorporateResult(barcode: string): OpenRouterCorporateOutput {
 	const prefix = getGs1RegistrationPrefix(barcode);
+	const unresolvedProduct = `Unresolved Product ${barcode}`;
 	return {
 		barcode,
 		product_identity: {
-			verified_name: `Barcode ${barcode}`,
-				brand: 'UNKNOWN BRAND',
-				verified_brand: 'UNKNOWN BRAND',
-			category: 'Unknown',
+			verified_name: unresolvedProduct,
+			brand: 'Unresolved Brand',
+			verified_brand: 'Unresolved Brand',
+			category: 'Unresolved Category',
 			confidence_score: 0.5
 		},
 		origin_details: {
-			physical_origin_country: 'UNKNOWN',
-				legal_registration_prefix: prefix,
-				source_of_origin: 'No reliable country-of-origin text in available evidence.'
+			physical_origin_country: 'Unresolved Origin',
+			legal_registration_prefix: prefix,
+			source_of_origin: 'No explicit country-of-origin evidence found in available sources.'
 		},
 		corporate_structure: {
-			ultimate_parent_company: 'UNKNOWN PARENT',
-			global_hq_country: 'UNKNOWN'
+			ultimate_parent_company: 'Unresolved Parent',
+			global_hq_country: 'Unresolved HQ Country'
 		},
 		compliance: {
 			is_flagged: false,
 			flag_reason: null
 		},
 		ownership_structure: {
-			manufacturer: 'UNKNOWN MANUFACTURER',
-			ultimate_parent: 'UNKNOWN PARENT',
-			parent_hq_country: 'UNKNOWN'
+			manufacturer: 'Unresolved Manufacturer',
+			ultimate_parent: 'Unresolved Parent',
+			parent_hq_country: 'Unresolved HQ Country'
 		},
 		compliance_status: {
 			is_flagged: false,
 			flag_reason: null
 		},
 		arbitration_log:
-			'Insufficient corroborated evidence; defaulted to unknown identity using conservative arbitration rules.',
-		product_name: `Barcode ${barcode}`,
-		verified_brand: 'UNKNOWN BRAND',
-		brand: 'UNKNOWN BRAND',
-		legal_holding_company: 'UNKNOWN PARENT',
-		holding_company_hq: 'UNKNOWN',
-		country_of_origin: 'UNKNOWN',
+			'Insufficient corroborated evidence; returned unresolved labels using conservative arbitration rules.',
+		product_name: unresolvedProduct,
+		verified_brand: 'Unresolved Brand',
+		brand: 'Unresolved Brand',
+		legal_holding_company: 'Unresolved Parent',
+		holding_company_hq: 'Unresolved HQ Country',
+		country_of_origin: 'Unresolved Origin',
 		is_flagged: false,
-		flag_reason: 'Search data is ambiguous; brand identified via internal knowledge.',
+		flag_reason: 'Search data is ambiguous; unresolved labels used until corroborated evidence is available.',
 		confidence_score: 0.5,
 		source_attribution: 'Internal_Knowledge',
 		data_sources_used: ['Internal_Knowledge'],
-		parent_company: 'UNKNOWN PARENT',
-		origin_country: 'UNKNOWN',
-		reasoning: 'Search data is ambiguous; brand identified via internal knowledge.'
+		parent_company: 'Unresolved Parent',
+		origin_country: 'Unresolved Origin',
+		reasoning: 'Search data is ambiguous; unresolved labels were used until corroborated evidence is available.'
 	};
 }
 
@@ -413,71 +426,51 @@ async function callOpenRouterAnalyzer(args: {
 		};
 	}
 
-	const offProductName = normalizeText(args.offProduct?.product_name) || 'UNKNOWN';
+	const offProductName = normalizeText(args.offProduct?.product_name) || 'Unresolved Product';
 	const offBrand =
-		normalizeText(args.offProduct?.brands) || normalizeText(args.offProduct?.brand_owner) || 'UNKNOWN';
+		normalizeText(args.offProduct?.brands) || normalizeText(args.offProduct?.brand_owner) || 'Unresolved Brand';
 
 	const systemPrompt = `PROTOCOL META:
-id=FORENSIC_ENTITY_AUDIT_V6_ULTIMATE
+id=FORENSIC_DATA_AUDITOR_V9_ULTIMATE
 strict_compliance=TRUE
-instruction_handling=DO NOT SUMMARIZE INSTRUCTIONS. EXECUTE STEPS SEQUENTIALLY.
+instruction_handling=STRICT_ZERO_SUMMARIZATION. EXECUTE ALL STEPS ATOMICALLY.
 
-AUDIT OBJECTIVE:
-Perform absolute, high-precision identification of product identity, physical manufacturing origin, and ultimate global parent company.
-Resolve contradictions between raw registry metadata and live marketplace/search evidence.
+OBJECTIVE:
+Eliminate Unknown product results and Missing Parent errors by recovering identity and ownership from search evidence.
 
 HIERARCHY OF TRUTH LOGIC:
-Gate 1 - Category_Lock:
-1) Extract functional category from all sources.
-2) If Registry/API category contradicts Scraper/Search category:
-   - Discard Registry/API identity as GTIN Collision or stale metadata.
-   - Re-identify the product from high-entropy live search text.
+Gate 1 - Identity_Recovery:
+1) If Registry/API data is null, unknown, stale, or contradictory, scan search snippets for GTIN-specific retail listings and extract the most frequent product name.
+2) Validate the product name against the category in snippets.
+3) If registry identity contradicts high-density search data, void the registry identity and use search data.
 
-Gate 2 - Retailer_By-pass:
-1) If brand owner is a supermarket/retailer/distributor, classify as Distributor.
-2) Pivot to manufacturer/manufacturer-of-brand behind private-label or retail-exclusive barcode.
+Gate 2 - Ownership_Recursion:
+1) Identify the immediate brand owner.
+2) Recursively trace Brand -> Manufacturer -> Global Parent until the ultimate holding company is reached.
+3) Never stop at a subsidiary when a parent chain can be established.
 
-Gate 3 - Origin_Arbitration:
-1) GS1 prefixes indicate legal registration HQ, not physical factory origin.
-2) Prioritize explicit "Produced in" / "Made in" / plant-level location evidence from live text.
-
-CORPORATE MAPPING PROTOCOL:
-1) Map brand to ultimate global holding company using verified conglomerate ownership.
-2) Distinguish brand from holding company for multinationals.
-
-ISRAELI CONNECTION LOGIC:
-1) Set is_flagged=true ONLY when direct, verifiable systemic links exist:
-   - global HQ in Israel, or
-   - >50% ownership by Israeli entities, or
-   - primary mission-critical manufacturing hubs in Israel.
-2) Set is_flagged=false when no structural holding link exists.
-3) Never force a match from associative metadata or fuzzy naming.
-
-OPERATIONAL MANDATE:
-1) If data is ambiguous/conflicting, lower confidence_score.
-2) Explain specific doubt in arbitration_log.
-3) Accuracy over certainty: low-confidence is preferred over incorrect high-confidence.
+Gate 3 - Compliance_Audit:
+1) Set is_flagged=true only if the ultimate parent has a direct HQ, >50% ownership, or primary mission-critical hubs in the target region.
+2) Provide the logical chain of ownership in the output.
 
 OUTPUT JSON ONLY:
 {
-	"product_identity": {
-		"verified_name": "string",
+	"product": {
+		"name": "string",
 		"brand": "string",
 		"category": "string",
-		"confidence_score": 0.0
+		"confidence": 0.0
 	},
-	"origin_details": {
-		"physical_origin_country": "string",
-		"legal_registration_prefix": "string",
-		"source_of_origin": "string"
-	},
-	"corporate_structure": {
-		"ultimate_parent_company": "string",
-		"global_hq_country": "string"
+	"corporate_hierarchy": {
+		"immediate_owner": "string",
+		"ultimate_parent": "string",
+		"parent_hq_country": "string",
+		"ownership_chain": "Brand -> Manufacturer -> Holding Company"
 	},
 	"compliance": {
 		"is_flagged": false,
-		"flag_reason": null
+		"flag_reason": null,
+		"source": "string"
 	},
 	"arbitration_log": "string"
 }`;
@@ -527,41 +520,47 @@ MERGED_CONTEXT:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 		const parsedConfidence =
 			typeof parsed.product_identity?.confidence_score === 'number'
 				? parsed.product_identity.confidence_score
+				: typeof parsed.product?.confidence === 'number'
+					? parsed.product.confidence
 				: parsed.confidence_score;
 		const confidence =
 			typeof parsedConfidence === 'number' ? Math.max(0, Math.min(1, parsedConfidence)) : 0.82;
-		const productName = normalizeText(parsed.product_name) || offProductName || `Barcode ${args.barcode}`;
+		const productName =
+			normalizeText(parsed.product_name) || normalizeText(parsed.product?.name) || offProductName || `Unresolved Product ${args.barcode}`;
 		const verifiedName =
-			normalizeText(parsed.product_identity?.verified_name) || productName || `Barcode ${args.barcode}`;
+			normalizeText(parsed.product_identity?.verified_name) || productName || `Unresolved Product ${args.barcode}`;
 		const brand =
-			normalizeText(parsed.product_identity?.brand || parsed.product_identity?.verified_brand || parsed.verified_brand || parsed.brand) ||
+			normalizeText(parsed.product_identity?.brand || parsed.product_identity?.verified_brand || parsed.verified_brand || parsed.brand || parsed.product?.brand) ||
 			offBrand ||
-			'UNKNOWN BRAND';
+			'Unresolved Brand';
 		const category =
 			normalizeText(parsed.product_identity?.category) ||
+			normalizeText(parsed.product?.category) ||
 			domainToCategory(detectLikelyDomain(args.contextText));
 		const manufacturer =
 			normalizeText(parsed.ownership_structure?.manufacturer) ||
+			normalizeText(parsed.corporate_hierarchy?.immediate_owner) ||
 			brand ||
-			'UNKNOWN MANUFACTURER';
+			'Unresolved Manufacturer';
 		let legalHoldingCompany =
-			normalizeText(parsed.ownership_structure?.ultimate_parent || parsed.legal_holding_company) ||
-			'UNKNOWN PARENT';
+			normalizeText(parsed.ownership_structure?.ultimate_parent || parsed.legal_holding_company || parsed.corporate_hierarchy?.ultimate_parent) ||
+			'Unresolved Parent';
 		const holdingCompanyHq =
 			normalizeText(
 				parsed.corporate_structure?.global_hq_country ||
 					parsed.ownership_structure?.parent_hq_country ||
-					parsed.holding_company_hq
-			) || 'UNKNOWN';
+					parsed.holding_company_hq ||
+					parsed.corporate_hierarchy?.parent_hq_country
+			) || 'Unresolved HQ Country';
 		const legalPrefix =
 			normalizeText(parsed.origin_details?.legal_registration_prefix) || getGs1RegistrationPrefix(args.barcode);
 		const originCountry =
 			normalizeText(parsed.origin_details?.physical_origin_country || parsed.country_of_origin) ||
 			extractPhysicalOriginFromContext(args.contextText) ||
-			'UNKNOWN';
+			'Unresolved Origin';
 		const sourceOfOrigin =
 			normalizeText(parsed.origin_details?.source_of_origin) ||
-			(originCountry !== 'UNKNOWN'
+			(originCountry !== 'Unresolved Origin'
 				? 'Derived from explicit made-in/produced-in context in live evidence.'
 				: 'No explicit produced-in evidence found; origin remains uncertain.');
 		const ambiguousNote = 'Search data is ambiguous; brand identified via internal knowledge.';
@@ -581,7 +580,7 @@ MERGED_CONTEXT:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 			'Applied arbitration gates using available evidence and selected highest-confidence manufacturer path.';
 
 		if (looksLikeRetailer(legalHoldingCompany) && !isPrivateLabelBrand(brand)) {
-			legalHoldingCompany = 'UNKNOWN PARENT';
+			legalHoldingCompany = 'Unresolved Parent';
 			flagReasonRaw = `${flagReasonRaw || 'Retailer/distributor name detected in ownership candidates.'} Retailer was treated as distributor and excluded.`;
 			arbitrationLog = `${arbitrationLog} Overrode distribution-layer entity and pivoted to manufacturer ownership.`;
 		}
@@ -710,8 +709,8 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 		cachedSourceRaw && ['Internal_Knowledge', 'GS1_Registry', 'Search_Scrape'].includes(cachedSourceRaw)
 			? cachedSourceRaw
 			: 'Internal_Knowledge';
-	const cachedCategory = normalizeText(cached.category) || 'Unknown';
-	const cachedParentHq = normalizeText(cached.parent_hq_country) || 'UNKNOWN';
+	const cachedCategory = normalizeText(cached.category) || 'Unresolved Category';
+	const cachedParentHq = normalizeText(cached.parent_hq_country) || 'Unresolved HQ Country';
 	const cachedArbitrationLog =
 		normalizeText(cached.arbitration_log) ||
 		'Loaded from cache; prior arbitration details unavailable in cached schema.';
@@ -720,18 +719,18 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 		barcode: cached.barcode,
 		product_identity: {
 			verified_name: `Barcode ${cached.barcode}`,
-			brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
-			verified_brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
+			brand: normalizeText(cached.brand) || 'Unresolved Brand',
+			verified_brand: normalizeText(cached.brand) || 'Unresolved Brand',
 			category: cachedCategory,
 			confidence_score: 0.95
 		},
 		origin_details: {
-			physical_origin_country: normalizeText(cached.origin_country) || 'UNKNOWN',
+			physical_origin_country: normalizeText(cached.origin_country) || 'Unresolved Origin',
 			legal_registration_prefix: getGs1RegistrationPrefix(cached.barcode),
 			source_of_origin: 'Loaded from cache; origin source detail may be unavailable.'
 		},
 		corporate_structure: {
-			ultimate_parent_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
+			ultimate_parent_company: normalizeText(cached.parent_company) || 'Unresolved Parent',
 			global_hq_country: cachedParentHq
 		},
 		compliance: {
@@ -739,8 +738,8 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 			flag_reason: Boolean(cached.is_flagged) ? 'Cached flagged result from Supabase.' : null
 		},
 		ownership_structure: {
-			manufacturer: normalizeText(cached.brand) || 'UNKNOWN MANUFACTURER',
-			ultimate_parent: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
+			manufacturer: normalizeText(cached.brand) || 'Unresolved Manufacturer',
+			ultimate_parent: normalizeText(cached.parent_company) || 'Unresolved Parent',
 			parent_hq_country: cachedParentHq
 		},
 		compliance_status: {
@@ -749,18 +748,18 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 		},
 		arbitration_log: cachedArbitrationLog,
 		product_name: `Barcode ${cached.barcode}`,
-		verified_brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
-		brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
-		legal_holding_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
+		verified_brand: normalizeText(cached.brand) || 'Unresolved Brand',
+		brand: normalizeText(cached.brand) || 'Unresolved Brand',
+		legal_holding_company: normalizeText(cached.parent_company) || 'Unresolved Parent',
 		holding_company_hq: cachedParentHq,
-		country_of_origin: normalizeText(cached.origin_country) || 'UNKNOWN',
+		country_of_origin: normalizeText(cached.origin_country) || 'Unresolved Origin',
 		is_flagged: Boolean(cached.is_flagged),
 		flag_reason: 'Cached result from Supabase.',
 		confidence_score: 0.95,
 		source_attribution: cachedSource,
 		data_sources_used: ['Internal_Knowledge'],
-		parent_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
-		origin_country: normalizeText(cached.origin_country) || 'UNKNOWN',
+		parent_company: normalizeText(cached.parent_company) || 'Unresolved Parent',
+		origin_country: normalizeText(cached.origin_country) || 'Unresolved Origin',
 		reasoning: cachedArbitrationLog
 	};
 }

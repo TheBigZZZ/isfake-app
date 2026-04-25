@@ -29,10 +29,10 @@
 
 	function getNestedIdentity(result: VerificationResult) {
 		return result.product_identity ?? {
-			verified_name: result.product_name ?? result.brand,
+			verified_name: result.product_name ?? `Unresolved Product ${result.barcode}`,
 			brand: result.brand,
 			verified_brand: result.verified_brand ?? result.brand,
-			category: 'Unknown',
+			category: 'Unresolved Category',
 			confidence_score: result.confidence_score ?? 0
 		};
 	}
@@ -40,14 +40,14 @@
 	function getNestedOrigin(result: VerificationResult) {
 		return result.origin_details ?? {
 			physical_origin_country: result.origin_country,
-			legal_registration_prefix: 'UNKNOWN'
+			legal_registration_prefix: 'Unresolved Prefix'
 		};
 	}
 
 	function getNestedCorp(result: VerificationResult) {
 		return result.corporate_structure ?? {
 			ultimate_parent_company: result.parent_company,
-			global_hq_country: result.holding_company_hq ?? 'UNKNOWN'
+			global_hq_country: result.holding_company_hq ?? 'Unresolved HQ Country'
 		};
 	}
 
@@ -73,7 +73,7 @@
 				{tone.label}
 			</span>
 			<span class="rounded-full border border-slate-600 px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-slate-300">
-				V6 forensic audit
+				V9 forensic audit
 			</span>
 		</div>
 
