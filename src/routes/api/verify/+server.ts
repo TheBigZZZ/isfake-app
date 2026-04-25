@@ -23,13 +23,15 @@ type OpenRouterCorporateOutput = {
 	barcode: string;
 	product_identity: {
 		verified_name: string;
-		verified_brand: string;
+		brand: string;
+		verified_brand?: string;
 		category: string;
 		confidence_score: number;
 	};
 	origin_details: {
 		physical_origin_country: string;
 		legal_registration_prefix: string;
+		source_of_origin?: string;
 	};
 	corporate_structure: {
 		ultimate_parent_company: string;
@@ -347,13 +349,15 @@ function fallbackCorporateResult(barcode: string): OpenRouterCorporateOutput {
 		barcode,
 		product_identity: {
 			verified_name: `Barcode ${barcode}`,
-			verified_brand: 'UNKNOWN BRAND',
+				brand: 'UNKNOWN BRAND',
+				verified_brand: 'UNKNOWN BRAND',
 			category: 'Unknown',
 			confidence_score: 0.5
 		},
 		origin_details: {
 			physical_origin_country: 'UNKNOWN',
-			legal_registration_prefix: prefix
+				legal_registration_prefix: prefix,
+				source_of_origin: 'No reliable country-of-origin text in available evidence.'
 		},
 		corporate_structure: {
 			ultimate_parent_company: 'UNKNOWN PARENT',
@@ -413,35 +417,46 @@ async function callOpenRouterAnalyzer(args: {
 	const offBrand =
 		normalizeText(args.offProduct?.brands) || normalizeText(args.offProduct?.brand_owner) || 'UNKNOWN';
 
-	const systemPrompt = `PROTOCOL: FORENSIC_ENTITY_AUDIT_V5.
+	const systemPrompt = `PROTOCOL META:
+id=FORENSIC_ENTITY_AUDIT_V6_ULTIMATE
+strict_compliance=TRUE
+instruction_handling=DO NOT SUMMARIZE INSTRUCTIONS. EXECUTE STEPS SEQUENTIALLY.
 
 AUDIT OBJECTIVE:
-- Identify product brand, physical manufacturing origin, and ultimate parent company.
-- Resolve contradictions between registry metadata and live marketplace/scraper data.
+Perform absolute, high-precision identification of product identity, physical manufacturing origin, and ultimate global parent company.
+Resolve contradictions between raw registry metadata and live marketplace/search evidence.
 
-LOGIC GATE 1 - Category_Verification:
+HIERARCHY OF TRUTH LOGIC:
+Gate 1 - Category_Lock:
 1) Extract functional category from all sources.
-2) If barcode API category contradicts scraper category, discard barcode API product identity entirely.
-3) Re-identify brand from high-entropy search snippets.
+2) If Registry/API category contradicts Scraper/Search category:
+   - Discard Registry/API identity as GTIN Collision or stale metadata.
+   - Re-identify the product from high-entropy live search text.
 
-LOGIC GATE 2 - Commercial_Disambiguation:
-1) Identify brand owner in the title.
-2) If entity is supermarket/grocery/retailer, mark as Distributor.
-3) Pivot to identify the real manufacturer/producer behind the brand.
+Gate 2 - Retailer_By-pass:
+1) If brand owner is a supermarket/retailer/distributor, classify as Distributor.
+2) Pivot to manufacturer/manufacturer-of-brand behind private-label or retail-exclusive barcode.
 
-LOGIC GATE 3 - Geopolitical_Auditing:
-1) GS1 prefix is legal registration only, not physical origin.
-2) Prioritize "Made in [Country]" from labels/manufacturer sources for physical origin.
-3) Map brand to ultimate parent using verified conglomerate ownership.
+Gate 3 - Origin_Arbitration:
+1) GS1 prefixes indicate legal registration HQ, not physical factory origin.
+2) Prioritize explicit "Produced in" / "Made in" / plant-level location evidence from live text.
 
-GEOPOLITICAL LOGIC:
-- is_flagged=true only for direct systemic link: HQ in Israel, >50% Israeli ownership, or primary manufacturing hubs in Israel.
-- default is_flagged=false when no direct evidence exists.
-- never use associative logic to force a match.
+CORPORATE MAPPING PROTOCOL:
+1) Map brand to ultimate global holding company using verified conglomerate ownership.
+2) Distinguish brand from holding company for multinationals.
 
-OPERATIONAL CONSTRAINTS:
-- prioritize high-entropy live snippets over static registry metadata.
-- if confidence_score < 0.7, explicitly mention ambiguity in arbitration_log.
+ISRAELI CONNECTION LOGIC:
+1) Set is_flagged=true ONLY when direct, verifiable systemic links exist:
+   - global HQ in Israel, or
+   - >50% ownership by Israeli entities, or
+   - primary mission-critical manufacturing hubs in Israel.
+2) Set is_flagged=false when no structural holding link exists.
+3) Never force a match from associative metadata or fuzzy naming.
+
+OPERATIONAL MANDATE:
+1) If data is ambiguous/conflicting, lower confidence_score.
+2) Explain specific doubt in arbitration_log.
+3) Accuracy over certainty: low-confidence is preferred over incorrect high-confidence.
 
 OUTPUT JSON ONLY:
 {
@@ -449,19 +464,20 @@ OUTPUT JSON ONLY:
 		"verified_name": "string",
 		"brand": "string",
 		"category": "string",
-		"confidence_score": number
+		"confidence_score": 0.0
 	},
 	"origin_details": {
 		"physical_origin_country": "string",
-		"legal_registration_prefix": "string"
+		"legal_registration_prefix": "string",
+		"source_of_origin": "string"
 	},
 	"corporate_structure": {
 		"ultimate_parent_company": "string",
 		"global_hq_country": "string"
 	},
 	"compliance": {
-		"is_flagged": boolean,
-		"flag_reason": "string|null"
+		"is_flagged": false,
+		"flag_reason": null
 	},
 	"arbitration_log": "string"
 }`;
@@ -543,6 +559,11 @@ MERGED_CONTEXT:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 			normalizeText(parsed.origin_details?.physical_origin_country || parsed.country_of_origin) ||
 			extractPhysicalOriginFromContext(args.contextText) ||
 			'UNKNOWN';
+		const sourceOfOrigin =
+			normalizeText(parsed.origin_details?.source_of_origin) ||
+			(originCountry !== 'UNKNOWN'
+				? 'Derived from explicit made-in/produced-in context in live evidence.'
+				: 'No explicit produced-in evidence found; origin remains uncertain.');
 		const ambiguousNote = 'Search data is ambiguous; brand identified via internal knowledge.';
 		const sourceAttributionRaw = normalizeText(parsed.source_attribution);
 		const sourceAttribution =
@@ -606,7 +627,8 @@ MERGED_CONTEXT:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 			},
 			origin_details: {
 				physical_origin_country: originCountry,
-				legal_registration_prefix: legalPrefix
+				legal_registration_prefix: legalPrefix,
+				source_of_origin: sourceOfOrigin
 			},
 			corporate_structure: {
 				ultimate_parent_company: legalHoldingCompany,
@@ -705,7 +727,8 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 		},
 		origin_details: {
 			physical_origin_country: normalizeText(cached.origin_country) || 'UNKNOWN',
-			legal_registration_prefix: getGs1RegistrationPrefix(cached.barcode)
+			legal_registration_prefix: getGs1RegistrationPrefix(cached.barcode),
+			source_of_origin: 'Loaded from cache; origin source detail may be unavailable.'
 		},
 		corporate_structure: {
 			ultimate_parent_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
@@ -787,55 +810,6 @@ async function cacheScanResult(result: {
 }
 
 async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
-	if (barcode.startsWith('729')) {
-		return {
-			barcode,
-			product_identity: {
-				verified_name: `Barcode ${barcode}`,
-				brand: 'SYSTEM PREFIX',
-				verified_brand: 'SYSTEM PREFIX',
-				category: 'Unknown',
-				confidence_score: 1
-			},
-			origin_details: {
-				physical_origin_country: 'Israel',
-				legal_registration_prefix: getGs1RegistrationPrefix(barcode)
-			},
-			corporate_structure: {
-				ultimate_parent_company: 'UNKNOWN PARENT',
-				global_hq_country: 'Israel'
-			},
-			compliance: {
-				is_flagged: true,
-				flag_reason: 'Barcode starts with 729, treated as GS1 Israeli hard-stop.'
-			},
-			ownership_structure: {
-				manufacturer: 'UNKNOWN MANUFACTURER',
-				ultimate_parent: 'UNKNOWN PARENT',
-				parent_hq_country: 'Israel'
-			},
-			compliance_status: {
-				is_flagged: true,
-				flag_reason: 'Barcode starts with 729, treated as GS1 Israeli hard-stop.'
-			},
-			arbitration_log: 'GS1 prefix hard-stop applied before external arbitration.',
-			product_name: `Barcode ${barcode}`,
-			verified_brand: 'SYSTEM PREFIX',
-			brand: 'SYSTEM PREFIX',
-			legal_holding_company: 'UNKNOWN PARENT',
-			holding_company_hq: 'Israel',
-			country_of_origin: 'Israel',
-			is_flagged: true,
-			flag_reason: 'Barcode starts with 729, treated as GS1 Israeli hard-stop.',
-			confidence_score: 1,
-			source_attribution: 'GS1_Registry',
-			data_sources_used: ['Internal_Knowledge'],
-			parent_company: 'UNKNOWN PARENT',
-			origin_country: 'Israel',
-			reasoning: 'Barcode starts with 729, treated as GS1 Israeli hard-stop.'
-		};
-	}
-
 	const cached = await loadCachedProduct(barcode);
 	if (cached) {
 		return cached;

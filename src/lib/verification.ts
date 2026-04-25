@@ -10,6 +10,7 @@ export type VerificationResult = {
 	origin_details?: {
 		physical_origin_country: string;
 		legal_registration_prefix: string;
+		source_of_origin?: string;
 	};
 	corporate_structure?: {
 		ultimate_parent_company: string;
