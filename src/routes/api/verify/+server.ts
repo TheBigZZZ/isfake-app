@@ -21,6 +21,21 @@ type OpenFoodFactsProduct = {
 
 type OpenRouterCorporateOutput = {
 	barcode: string;
+	product_identity: {
+		verified_brand: string;
+		category: string;
+		confidence_score: number;
+	};
+	ownership_structure: {
+		manufacturer: string;
+		ultimate_parent: string;
+		parent_hq_country: string;
+	};
+	compliance_status: {
+		is_flagged: boolean;
+		flag_reason: string | null;
+	};
+	arbitration_log: string;
 	product_name: string;
 	verified_brand: string;
 	brand: string;
@@ -177,6 +192,26 @@ function detectLikelyDomain(text: string): 'food' | 'electronics' | 'unknown' {
 	return 'unknown';
 }
 
+function domainToCategory(domain: 'food' | 'electronics' | 'unknown') {
+	if (domain === 'food') return 'Beverage/Food';
+	if (domain === 'electronics') return 'Electronics';
+	return 'Unknown';
+}
+
+function hasDirectEvidenceForFlag(reason: string) {
+	const normalized = normalizeText(reason).toLowerCase();
+	if (!normalized) return false;
+	return (
+		normalized.includes('headquarter') ||
+		normalized.includes('headquartered') ||
+		normalized.includes('ownership') ||
+		normalized.includes('owned') ||
+		normalized.includes('manufacturing') ||
+		normalized.includes('manufacturing site') ||
+		normalized.includes('factory')
+	);
+}
+
 function buildScrapeHeaders() {
 	return {
 		'User-Agent': GOOGLE_MOBILE_USER_AGENT,
@@ -279,6 +314,22 @@ async function semanticGoogleScrape(barcode: string) {
 function fallbackCorporateResult(barcode: string): OpenRouterCorporateOutput {
 	return {
 		barcode,
+		product_identity: {
+			verified_brand: 'UNKNOWN BRAND',
+			category: 'Unknown',
+			confidence_score: 0.5
+		},
+		ownership_structure: {
+			manufacturer: 'UNKNOWN MANUFACTURER',
+			ultimate_parent: 'UNKNOWN PARENT',
+			parent_hq_country: 'UNKNOWN'
+		},
+		compliance_status: {
+			is_flagged: false,
+			flag_reason: null
+		},
+		arbitration_log:
+			'Insufficient corroborated evidence; defaulted to unknown identity using conservative arbitration rules.',
 		product_name: `Barcode ${barcode}`,
 		verified_brand: 'UNKNOWN BRAND',
 		brand: 'UNKNOWN BRAND',
@@ -318,49 +369,52 @@ async function callOpenRouterAnalyzer(args: {
 	const offBrand =
 		normalizeText(args.offProduct?.brands) || normalizeText(args.offProduct?.brand_owner) || 'UNKNOWN';
 
-	const systemPrompt = `ROLE: Corporate Fact-Checker.
+	const systemPrompt = `ROLE: Data Arbitrator for Corporate Ownership.
 
-OBJECTIVE:
-- Perform high-precision corporate auditing for barcode ${args.barcode}.
-- Resolve conflicts between retailer/distributor listings and manufacturer ownership.
+TASK OBJECTIVE:
+- Identify product brand and ultimate parent company with maximum factual precision.
+- Resolve contradictions between registry/API data and marketplace/scraper data.
 
-DATA HIERARCHY PROTOCOL:
-1) Internal_Knowledge first for confirmed global ownership structures.
-2) GS1_Registry second: if licensee appears to be a retailer/supermarket, treat as Distributor and continue.
-3) Search_Scrape third: extract the true brand from snippet titles/context.
+AUDIT LOGIC GATES:
+GATE 1 - Category_Consistency_Check
+1) Extract functional category from all sources (for example Beverage, Electronics, Appliance).
+2) If registry category conflicts with web-scrape/search category, assume GTIN collision or stale metadata.
+3) Action: discard registry product identity and re-identify brand from high-entropy scrape snippets.
 
-ANTI-HALLUCINATION FILTERS:
-- STRICT retailer bypass: never output supermarkets/grocery/distributors as legal_holding_company unless verified_brand is a private-label store brand (Great Value, Kirkland, etc.).
-- Barcode squatting check: if data appears mismatched to product type (example: electronics signal for food item), discard mismatched source and rely on better-matching evidence.
+GATE 2 - Commercial_Entity_Filter
+1) Identify brand owner in title/description context.
+2) Check whether the entity is retailer/supermarket/distributor.
+3) If yes, treat as distribution layer and pivot to the manufacturer.
+4) If no, continue to ultimate global parent.
 
-COLLISION HANDLING:
-- If sources conflict, explicitly separate entities and pick only the correct manufacturer brand for this barcode.
-- Example logic: OFF says Albert Heijn, Search says SodaStream. Albert Heijn is retailer/distributor; SodaStream is manufacturer; final parent is PepsiCo.
+STRICT VERIFICATION RULES:
+- Set is_flagged=true only if direct legal/structural evidence exists (HQ, >50% ownership, or primary manufacturing sites) for the specific identified manufacturer.
+- Default must be is_flagged=false when evidence is absent.
+- Do not anchor on a target name if evidence points to a non-target product.
 
-ISRAELI CONNECTION LOGIC:
-- Flag true when there is deep systemic Israeli linkage: headquarters in Israel, major Israeli manufacturing hubs, or 50%+ ownership by Israeli entities.
-- Even with non-Israeli country_of_origin, still flag true when such linkage exists and explain it in flag_reason.
+OPERATIONAL CONSTRAINTS:
+- Prioritize high-entropy scrape snippets over static registry metadata.
+- Never infer parent-subsidiary relationships from visual similarity or shared distributors.
+- If confidence_score < 0.7, explicitly state ambiguity in arbitration_log.
 
 OUTPUT JSON ONLY:
 {
-	"barcode": "string",
-	"verified_brand": "string",
-	"legal_holding_company": "string",
-	"holding_company_hq": "string",
-	"country_of_origin": "string",
-	"is_flagged": boolean,
-	"flag_reason": "string",
-	"confidence_score": number,
-	"source_attribution": "Internal_Knowledge|GS1_Registry|Search_Scrape",
-	"product_name": "string",
-	"brand": "string",
-	"data_sources_used": ["OFF_API", "Search_Scrape", "Internal_Knowledge"]
-}
-
-HARD RULES:
-- Never output a retailer chain as legal_holding_company unless private-label exception applies.
-- Never merge competitors without explicit ownership evidence.
-- If confidence_score < 0.9, include exactly this sentence in flag_reason: "Search data is ambiguous; brand identified via internal knowledge."`;
+	"product_identity": {
+		"verified_brand": "string",
+		"category": "string",
+		"confidence_score": number
+	},
+	"ownership_structure": {
+		"manufacturer": "string",
+		"ultimate_parent": "string",
+		"parent_hq_country": "string"
+	},
+	"compliance_status": {
+		"is_flagged": boolean,
+		"flag_reason": "string|null"
+	},
+	"arbitration_log": "string"
+}`;
 
 	const userPrompt = `BARCODE: ${args.barcode}
 OFF_HINT_PRODUCT: ${offProductName}
@@ -404,26 +458,59 @@ MERGED_CONTEXT:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 
 	try {
 		const parsed = JSON.parse(extractJsonObject(content)) as Partial<OpenRouterCorporateOutput>;
+		const parsedConfidence =
+			typeof parsed.product_identity?.confidence_score === 'number'
+				? parsed.product_identity.confidence_score
+				: parsed.confidence_score;
 		const confidence =
-			typeof parsed.confidence_score === 'number'
-				? Math.max(0, Math.min(1, parsed.confidence_score))
-				: 0.82;
+			typeof parsedConfidence === 'number' ? Math.max(0, Math.min(1, parsedConfidence)) : 0.82;
 		const productName = normalizeText(parsed.product_name) || offProductName || `Barcode ${args.barcode}`;
-		const brand = normalizeText(parsed.verified_brand || parsed.brand) || offBrand || 'UNKNOWN BRAND';
-		let legalHoldingCompany = normalizeText(parsed.legal_holding_company) || 'UNKNOWN PARENT';
-		const holdingCompanyHq = normalizeText(parsed.holding_company_hq) || 'UNKNOWN';
+		const brand =
+			normalizeText(parsed.product_identity?.verified_brand || parsed.verified_brand || parsed.brand) ||
+			offBrand ||
+			'UNKNOWN BRAND';
+		const category =
+			normalizeText(parsed.product_identity?.category) ||
+			domainToCategory(detectLikelyDomain(args.contextText));
+		const manufacturer =
+			normalizeText(parsed.ownership_structure?.manufacturer) ||
+			brand ||
+			'UNKNOWN MANUFACTURER';
+		let legalHoldingCompany =
+			normalizeText(parsed.ownership_structure?.ultimate_parent || parsed.legal_holding_company) ||
+			'UNKNOWN PARENT';
+		const holdingCompanyHq =
+			normalizeText(parsed.ownership_structure?.parent_hq_country || parsed.holding_company_hq) || 'UNKNOWN';
 		const originCountry = normalizeText(parsed.country_of_origin) || 'UNKNOWN';
 		const ambiguousNote = 'Search data is ambiguous; brand identified via internal knowledge.';
 		const sourceAttributionRaw = normalizeText(parsed.source_attribution);
 		const sourceAttribution =
 			sourceAttributionRaw && ['Internal_Knowledge', 'GS1_Registry', 'Search_Scrape'].includes(sourceAttributionRaw)
 				? sourceAttributionRaw
-				: 'Internal_Knowledge';
-		let flagReasonRaw = normalizeText(parsed.flag_reason);
+				: args.sourcesUsed.includes('Search_Scrape')
+					? 'Search_Scrape'
+					: 'Internal_Knowledge';
+		let flagReasonRaw =
+			normalizeText(parsed.compliance_status?.flag_reason ?? parsed.flag_reason) ||
+			'No direct documented structural link found.';
+		let flagged = Boolean(parsed.compliance_status?.is_flagged ?? parsed.is_flagged);
+		let arbitrationLog =
+			normalizeText(parsed.arbitration_log) ||
+			'Applied arbitration gates using available evidence and selected highest-confidence manufacturer path.';
 
 		if (looksLikeRetailer(legalHoldingCompany) && !isPrivateLabelBrand(brand)) {
 			legalHoldingCompany = 'UNKNOWN PARENT';
 			flagReasonRaw = `${flagReasonRaw || 'Retailer/distributor name detected in ownership candidates.'} Retailer was treated as distributor and excluded.`;
+			arbitrationLog = `${arbitrationLog} Overrode distribution-layer entity and pivoted to manufacturer ownership.`;
+		}
+
+		if (confidence < 0.7 && !arbitrationLog.toLowerCase().includes('ambigu')) {
+			arbitrationLog = `${arbitrationLog} Ambiguity remains due to low confidence evidence.`;
+		}
+
+		if (flagged && !hasDirectEvidenceForFlag(flagReasonRaw)) {
+			flagged = false;
+			flagReasonRaw = 'No direct documented structural link found.';
 		}
 
 		const flagReason =
@@ -449,13 +536,28 @@ MERGED_CONTEXT:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 
 		return {
 			barcode: args.barcode,
+			product_identity: {
+				verified_brand: brand,
+				category,
+				confidence_score: confidence
+			},
+			ownership_structure: {
+				manufacturer,
+				ultimate_parent: legalHoldingCompany,
+				parent_hq_country: holdingCompanyHq
+			},
+			compliance_status: {
+				is_flagged: flagged,
+				flag_reason: flagged ? flagReason : null
+			},
+			arbitration_log: arbitrationLog,
 			product_name: productName,
 			verified_brand: brand,
 			brand,
 			legal_holding_company: legalHoldingCompany,
 			holding_company_hq: holdingCompanyHq,
 			country_of_origin: originCountry,
-			is_flagged: Boolean(parsed.is_flagged),
+			is_flagged: flagged,
 			flag_reason: flagReason,
 			confidence_score: confidence,
 			source_attribution: sourceAttribution,
@@ -490,6 +592,21 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 
 	return {
 		barcode: cached.barcode,
+		product_identity: {
+			verified_brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
+			category: 'Unknown',
+			confidence_score: 0.95
+		},
+		ownership_structure: {
+			manufacturer: normalizeText(cached.brand) || 'UNKNOWN MANUFACTURER',
+			ultimate_parent: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
+			parent_hq_country: 'UNKNOWN'
+		},
+		compliance_status: {
+			is_flagged: Boolean(cached.is_flagged),
+			flag_reason: Boolean(cached.is_flagged) ? 'Cached flagged result from Supabase.' : null
+		},
+		arbitration_log: 'Loaded from cache; prior arbitration details unavailable in cached schema.',
 		product_name: `Barcode ${cached.barcode}`,
 		verified_brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
 		brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
@@ -534,6 +651,21 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	if (barcode.startsWith('729')) {
 		return {
 			barcode,
+			product_identity: {
+				verified_brand: 'SYSTEM PREFIX',
+				category: 'Unknown',
+				confidence_score: 1
+			},
+			ownership_structure: {
+				manufacturer: 'UNKNOWN MANUFACTURER',
+				ultimate_parent: 'UNKNOWN PARENT',
+				parent_hq_country: 'Israel'
+			},
+			compliance_status: {
+				is_flagged: true,
+				flag_reason: 'Barcode starts with 729, treated as GS1 Israeli hard-stop.'
+			},
+			arbitration_log: 'GS1 prefix hard-stop applied before external arbitration.',
 			product_name: `Barcode ${barcode}`,
 			verified_brand: 'SYSTEM PREFIX',
 			brand: 'SYSTEM PREFIX',

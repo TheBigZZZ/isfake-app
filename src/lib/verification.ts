@@ -1,5 +1,20 @@
 export type VerificationResult = {
 	barcode: string;
+	product_identity?: {
+		verified_brand: string;
+		category: string;
+		confidence_score: number;
+	};
+	ownership_structure?: {
+		manufacturer: string;
+		ultimate_parent: string;
+		parent_hq_country: string;
+	};
+	compliance_status?: {
+		is_flagged: boolean;
+		flag_reason: string | null;
+	};
+	arbitration_log?: string;
 	product_name?: string;
 	verified_brand?: string;
 	brand: string;
