@@ -11,7 +11,7 @@ export type VerificationResult = {
 	is_israeli: boolean;
 	confidence: number;
 	status: VerificationStatus;
-	source: 'fast-pass' | 'openrouter' | 'consensus' | 'cached' | 'fallback';
+	source: 'fast-pass' | 'openfoodfacts' | 'openfoodfacts+openrouter' | 'openrouter' | 'consensus' | 'cached' | 'fallback';
 	vote_count?: number;
 	verify_votes?: number;
 	correct_votes?: number;

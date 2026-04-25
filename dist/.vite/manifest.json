@@ -1,6 +1,6 @@
 {
   ".svelte-kit/generated/client-optimized/app.js": {
-    "file": "_app/immutable/entry/app.PpHJFDJk.js",
+    "file": "_app/immutable/entry/app.DNC6w7V0.js",
     "name": "entry/app",
     "src": ".svelte-kit/generated/client-optimized/app.js",
     "isEntry": true,
@@ -30,12 +30,12 @@
     ]
   },
   ".svelte-kit/generated/client-optimized/nodes/1.js": {
-    "file": "_app/immutable/nodes/1.efs0nw9C.js",
+    "file": "_app/immutable/nodes/1.BLpsbxFd.js",
     "name": "nodes/1",
     "src": ".svelte-kit/generated/client-optimized/nodes/1.js",
     "isEntry": true,
     "imports": [
-      "_CSPnRRH4.js",
+      "_BBkeNTH0.js",
       "_CzTzyPtj.js",
       "_DXLwiZ0H.js"
     ]
@@ -57,6 +57,13 @@
       "node_modules/@capacitor/app/dist/esm/web.js"
     ]
   },
+  "_BBkeNTH0.js": {
+    "file": "_app/immutable/chunks/BBkeNTH0.js",
+    "name": "client",
+    "imports": [
+      "_CzTzyPtj.js"
+    ]
+  },
   "_BcgnSMxp.js": {
     "file": "_app/immutable/chunks/BcgnSMxp.js",
     "name": "preload-helper"
@@ -64,13 +71,6 @@
   "_ByPWl-Qi.js": {
     "file": "_app/immutable/chunks/ByPWl-Qi.js",
     "name": "chunk"
-  },
-  "_CSPnRRH4.js": {
-    "file": "_app/immutable/chunks/CSPnRRH4.js",
-    "name": "client",
-    "imports": [
-      "_CzTzyPtj.js"
-    ]
   },
   "_CzTzyPtj.js": {
     "file": "_app/immutable/chunks/CzTzyPtj.js",
@@ -114,12 +114,12 @@
     ]
   },
   "node_modules/@sveltejs/kit/src/runtime/client/entry.js": {
-    "file": "_app/immutable/entry/start.OPHUkdVZ.js",
+    "file": "_app/immutable/entry/start.Dg7U1hfH.js",
     "name": "entry/start",
     "src": "node_modules/@sveltejs/kit/src/runtime/client/entry.js",
     "isEntry": true,
     "imports": [
-      "_CSPnRRH4.js"
+      "_BBkeNTH0.js"
     ]
   }
 }

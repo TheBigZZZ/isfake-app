@@ -26,7 +26,26 @@ type OpenRouterDataCleanerOutput = {
 	confidence?: number;
 };
 
+type OpenFoodFactsProduct = {
+	product_name?: string;
+	brands?: string;
+	brand_owner?: string;
+	generic_name?: string;
+	quantity?: string;
+	categories?: string;
+	countries?: string;
+	ingredients_text?: string;
+	labels?: string;
+	packaging?: string;
+	image_front_url?: string;
+	image_url?: string;
+	nova_group?: string;
+	nutriscore_grade?: string;
+	ecoscore_grade?: string;
+};
+
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPEN_FOOD_FACTS_API_URL = 'https://world.openfoodfacts.org/api/v2/product';
 const OPENROUTER_MODEL = env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-001';
 const BROWSER_ACCEPT_HEADER =
 	'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
@@ -78,6 +97,49 @@ function buildFetchHeaders(extraHeaders?: Record<string, string>) {
 		...buildScrapeHeaders(),
 		...extraHeaders
 	};
+}
+
+function buildOpenFoodFactsContext(product: OpenFoodFactsProduct) {
+	const lines = [
+		`Product name: ${normalizeText(product.product_name) || 'UNKNOWN PRODUCT'}`,
+		`Brand(s): ${normalizeText(product.brands) || normalizeText(product.brand_owner) || 'UNKNOWN BRAND'}`,
+		`Generic name: ${normalizeText(product.generic_name) || 'N/A'}`,
+		`Quantity: ${normalizeText(product.quantity) || 'N/A'}`,
+		`Categories: ${normalizeText(product.categories) || 'N/A'}`,
+		`Countries: ${normalizeText(product.countries) || 'N/A'}`,
+		`Ingredients: ${normalizeText(product.ingredients_text) || 'N/A'}`,
+		`Labels: ${normalizeText(product.labels) || 'N/A'}`,
+		`Packaging: ${normalizeText(product.packaging) || 'N/A'}`,
+		`Nutri-Score: ${normalizeText(product.nutriscore_grade) || 'N/A'}`,
+		`Eco-Score: ${normalizeText(product.ecoscore_grade) || 'N/A'}`,
+		`Nova group: ${normalizeText(product.nova_group) || 'N/A'}`
+	];
+
+	return lines.join('\n');
+}
+
+async function lookupOpenFoodFactsProduct(barcode: string) {
+	const response = await fetch(`${OPEN_FOOD_FACTS_API_URL}/${encodeURIComponent(barcode)}.json`, {
+		headers: {
+			Accept: 'application/json',
+			'User-Agent': GOOGLE_MOBILE_USER_AGENT
+		}
+	});
+
+	if (!response.ok) {
+		return null;
+	}
+
+	const payload = (await response.json()) as {
+		status?: number;
+		product?: OpenFoodFactsProduct;
+	};
+
+	if (payload.status !== 1 || !payload.product) {
+		return null;
+	}
+
+	return payload.product;
 }
 
 function extractJsonObject(rawText: string) {
@@ -313,6 +375,7 @@ Context Block:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 }
 
 async function loadCachedProduct(barcode: string) {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const adminSupabase = getAdminSupabase() as any;
 	const { data } = await adminSupabase
 		.from('products')
@@ -349,6 +412,7 @@ async function cacheScanResult(result: {
 	confidence: number;
 	status: 'verified' | 'pending' | 'review';
 }) {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const adminSupabase = getAdminSupabase() as any;
 
 	await adminSupabase.from('products').upsert(
@@ -383,8 +447,11 @@ async function robustScan(barcode: string) {
 		};
 	}
 
+	const openFoodFactsProduct = await lookupOpenFoodFactsProduct(barcode).catch(() => null);
+	const openFoodFactsContext = openFoodFactsProduct ? buildOpenFoodFactsContext(openFoodFactsProduct) : '';
+
 	const cached = await loadCachedProduct(barcode);
-	if (cached) {
+	if (cached && !openFoodFactsProduct) {
 		return cached;
 	}
 
@@ -395,8 +462,8 @@ async function robustScan(barcode: string) {
 		contextText: ''
 	}));
 
-	const mergedContextText = scrape.contextText;
-	const knowledgeOnly = scrape.blocked || !scrape.hasContext || mergedContextText.length < 50;
+	const mergedContextText = [openFoodFactsContext, scrape.contextText].filter(Boolean).join('\n\n');
+	const knowledgeOnly = scrape.blocked || (!scrape.hasContext && !openFoodFactsContext) || mergedContextText.length < 50;
 	const ai = await callOpenRouterDataCleaner({
 		barcode,
 		contextText: mergedContextText,
@@ -405,16 +472,20 @@ async function robustScan(barcode: string) {
 
 	const confidence = Math.max(0, Math.min(1, ai.confidence ?? (knowledgeOnly ? 0.35 : 0.6)));
 	const needsReview = knowledgeOnly || confidence < 0.55;
+	const offName = normalizeText(openFoodFactsProduct?.product_name) || `Barcode ${barcode}`;
+	const offBrand =
+		normalizeText(openFoodFactsProduct?.brands) || normalizeText(openFoodFactsProduct?.brand_owner) || 'UNKNOWN BRAND';
+	const source = openFoodFactsProduct ? 'openfoodfacts+openrouter' : knowledgeOnly ? 'fallback' : 'openrouter';
 	const result = {
 		barcode,
-		name: ai.name || `Barcode ${barcode}`,
-		brand: ai.brand || 'UNKNOWN BRAND',
+		name: ai.name || offName,
+		brand: ai.brand || offBrand,
 		context_text: mergedContextText,
 		reasoning: ai.reason,
 		is_israeli: ai.is_israeli,
 		confidence,
 		status: needsReview ? 'review' : 'pending',
-		source: knowledgeOnly ? 'fallback' : 'openrouter',
+		source,
 		needs_review: needsReview,
 		vote_count: 0,
 		verify_votes: 0,
