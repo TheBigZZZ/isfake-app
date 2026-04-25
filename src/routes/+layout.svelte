@@ -12,6 +12,6 @@
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
 </svelte:head>
 
-<div class="app-shell h-dvh w-full overflow-hidden text-slate-100 antialiased font-[Manrope,sans-serif]">
+<div class="app-shell h-dvh w-full overflow-x-hidden overflow-y-auto text-slate-100 antialiased font-[Manrope,sans-serif]">
   {@render children()}
 </div>

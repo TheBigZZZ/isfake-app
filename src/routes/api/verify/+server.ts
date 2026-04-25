@@ -71,6 +71,10 @@ type CachedProductRow = {
 	parent_company: string;
 	origin_country: string;
 	is_flagged: boolean;
+	category?: string | null;
+	parent_hq_country?: string | null;
+	source_attribution?: string | null;
+	arbitration_log?: string | null;
 };
 
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
@@ -651,15 +655,44 @@ MERGED_CONTEXT:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOutput | null> {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const adminSupabase = getAdminSupabase() as any;
-	const { data } = await adminSupabase
+	const baseSelect = 'barcode,brand,parent_company,origin_country,is_flagged';
+	const extendedSelect = `${baseSelect},category,parent_hq_country,source_attribution,arbitration_log`;
+
+	let { data, error } = await adminSupabase
 		.from('products')
-		.select('barcode,brand,parent_company,origin_country,is_flagged')
+		.select(extendedSelect)
 		.eq('barcode', barcode)
 		.maybeSingle();
+
+	if (error) {
+		console.warn('[verify] extended cache select failed, falling back to base columns', error);
+		const fallback = await adminSupabase
+			.from('products')
+			.select(baseSelect)
+			.eq('barcode', barcode)
+			.maybeSingle();
+		data = fallback.data;
+		error = fallback.error;
+	}
+
+	if (error) {
+		console.error('[verify] cache select failed', error);
+		return null;
+	}
 
 	if (!data) return null;
 
 	const cached = data as CachedProductRow;
+	const cachedSourceRaw = normalizeText(cached.source_attribution);
+	const cachedSource =
+		cachedSourceRaw && ['Internal_Knowledge', 'GS1_Registry', 'Search_Scrape'].includes(cachedSourceRaw)
+			? cachedSourceRaw
+			: 'Internal_Knowledge';
+	const cachedCategory = normalizeText(cached.category) || 'Unknown';
+	const cachedParentHq = normalizeText(cached.parent_hq_country) || 'UNKNOWN';
+	const cachedArbitrationLog =
+		normalizeText(cached.arbitration_log) ||
+		'Loaded from cache; prior arbitration details unavailable in cached schema.';
 
 	return {
 		barcode: cached.barcode,
@@ -667,7 +700,7 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 			verified_name: `Barcode ${cached.barcode}`,
 			brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
 			verified_brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
-			category: 'Unknown',
+			category: cachedCategory,
 			confidence_score: 0.95
 		},
 		origin_details: {
@@ -676,7 +709,7 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 		},
 		corporate_structure: {
 			ultimate_parent_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
-			global_hq_country: 'UNKNOWN'
+			global_hq_country: cachedParentHq
 		},
 		compliance: {
 			is_flagged: Boolean(cached.is_flagged),
@@ -685,27 +718,27 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 		ownership_structure: {
 			manufacturer: normalizeText(cached.brand) || 'UNKNOWN MANUFACTURER',
 			ultimate_parent: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
-			parent_hq_country: 'UNKNOWN'
+			parent_hq_country: cachedParentHq
 		},
 		compliance_status: {
 			is_flagged: Boolean(cached.is_flagged),
 			flag_reason: Boolean(cached.is_flagged) ? 'Cached flagged result from Supabase.' : null
 		},
-		arbitration_log: 'Loaded from cache; prior arbitration details unavailable in cached schema.',
+		arbitration_log: cachedArbitrationLog,
 		product_name: `Barcode ${cached.barcode}`,
 		verified_brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
 		brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
 		legal_holding_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
-		holding_company_hq: 'UNKNOWN',
+		holding_company_hq: cachedParentHq,
 		country_of_origin: normalizeText(cached.origin_country) || 'UNKNOWN',
 		is_flagged: Boolean(cached.is_flagged),
 		flag_reason: 'Cached result from Supabase.',
 		confidence_score: 0.95,
-		source_attribution: 'Internal_Knowledge',
+		source_attribution: cachedSource,
 		data_sources_used: ['Internal_Knowledge'],
 		parent_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
 		origin_country: normalizeText(cached.origin_country) || 'UNKNOWN',
-		reasoning: 'Cached result from Supabase.'
+		reasoning: cachedArbitrationLog
 	};
 }
 
@@ -714,22 +747,43 @@ async function cacheScanResult(result: {
 	brand: string;
 	legal_holding_company: string;
 	country_of_origin: string;
+	category: string;
+	parent_hq_country: string;
+	source_attribution: string;
+	arbitration_log: string;
 	is_flagged: boolean;
 }) {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const adminSupabase = getAdminSupabase() as any;
+	const basePayload = {
+		barcode: result.barcode,
+		brand: result.brand,
+		parent_company: result.legal_holding_company,
+		origin_country: result.country_of_origin,
+		is_flagged: result.is_flagged,
+		updated_at: new Date().toISOString()
+	};
 
-	await adminSupabase.from('products').upsert(
-		{
-			barcode: result.barcode,
-			brand: result.brand,
-			parent_company: result.legal_holding_company,
-			origin_country: result.country_of_origin,
-			is_flagged: result.is_flagged,
-			updated_at: new Date().toISOString()
-		},
-		{ onConflict: 'barcode' }
-	);
+	const extendedPayload = {
+		...basePayload,
+		category: result.category,
+		parent_hq_country: result.parent_hq_country,
+		source_attribution: result.source_attribution,
+		arbitration_log: result.arbitration_log
+	};
+
+	let { error } = await adminSupabase.from('products').upsert(extendedPayload, { onConflict: 'barcode' });
+
+	if (error) {
+		console.warn('[verify] extended cache upsert failed, retrying base payload', error);
+		const fallback = await adminSupabase.from('products').upsert(basePayload, { onConflict: 'barcode' });
+		error = fallback.error;
+	}
+
+	if (error) {
+		console.error('[verify] cache upsert failed', error);
+		throw new Error('Failed to persist verification result to products cache.');
+	}
 }
 
 async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
@@ -829,6 +883,10 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		brand: ai.brand,
 		legal_holding_company: ai.legal_holding_company,
 		country_of_origin: ai.country_of_origin,
+		category: ai.product_identity.category,
+		parent_hq_country: ai.corporate_structure.global_hq_country,
+		source_attribution: ai.source_attribution,
+		arbitration_log: ai.arbitration_log,
 		is_flagged: ai.is_flagged
 	});
 

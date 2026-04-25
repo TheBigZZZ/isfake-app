@@ -78,7 +78,7 @@
   };
 </script>
 
-<main class="flex h-full min-h-0 w-full flex-col overflow-hidden px-4 py-5">
+<main class="flex h-full min-h-0 w-full flex-col overflow-x-hidden overflow-y-auto px-4 py-5">
   <div class="mx-auto flex w-full max-w-md flex-col gap-4">
     <header class="mb-2 anim-in">
       <h1 class="font-[Fraunces,serif] text-3xl leading-none text-white">IsFake</h1>
