@@ -53,6 +53,7 @@ const GOOGLE_MOBILE_USER_AGENT =
 	'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const ALLOWED_ORIGINS = new Set([
 	'https://localhost',
+	'https://localhost:5173',
 	'http://localhost',
 	'http://localhost:5173',
 	'capacitor://localhost',
@@ -75,6 +76,21 @@ export const OPTIONS: RequestHandler = async ({ request }) => {
 		status: 204,
 		headers: corsHeaders(request.headers.get('origin'))
 	});
+};
+
+export const GET: RequestHandler = async ({ request }) => {
+	return json(
+		{
+			error: 'GET method not allowed. Use POST /api/verify with JSON body: { "barcode": "..." }.'
+		},
+		{
+			status: 405,
+			headers: {
+				...corsHeaders(request.headers.get('origin')),
+				Allow: 'POST, OPTIONS'
+			}
+		}
+	);
 };
 
 function normalizeText(value: string | null | undefined) {
