@@ -22,12 +22,15 @@ type OpenFoodFactsProduct = {
 type OpenRouterCorporateOutput = {
 	barcode: string;
 	product_name: string;
+	verified_brand: string;
 	brand: string;
 	legal_holding_company: string;
+	holding_company_hq: string;
 	country_of_origin: string;
 	is_flagged: boolean;
 	flag_reason: string;
 	confidence_score: number;
+	source_attribution: string;
 	data_sources_used: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'>;
 	parent_company: string;
 	origin_country: string;
@@ -57,6 +60,67 @@ const ALLOWED_ORIGINS = new Set([
 	'capacitor://localhost',
 	'https://isfake-app.onrender.com'
 ]);
+
+const RETAILER_TERMS = [
+	'albert heijn',
+	'walmart',
+	'tesco',
+	'carrefour',
+	'dollar general',
+	'kroger',
+	'costco',
+	'whole foods',
+	'amazon',
+	'aldi',
+	'lidl',
+	'sainsbury',
+	'asda',
+	'target'
+];
+
+const PRIVATE_LABEL_TERMS = [
+	'great value',
+	'kirkland',
+	'equate',
+	'member\'s mark',
+	'tesco finest',
+	'carrefour classic',
+	'simple truth'
+];
+
+const FOOD_KEYWORDS = [
+	'food',
+	'beverage',
+	'drink',
+	'snack',
+	'juice',
+	'soda',
+	'water',
+	'milk',
+	'coffee',
+	'tea',
+	'chocolate',
+	'candy',
+	'cookie',
+	'cereal',
+	'pasta',
+	'sauce'
+];
+
+const ELECTRONICS_KEYWORDS = [
+	'electronic',
+	'electronics',
+	'phone',
+	'laptop',
+	'charger',
+	'headphones',
+	'bluetooth',
+	'usb',
+	'tv',
+	'monitor',
+	'camera',
+	'gaming'
+];
 
 function corsHeaders(origin: string | null) {
 	const allowOrigin = origin && ALLOWED_ORIGINS.has(origin) ? origin : 'https://localhost';
@@ -92,6 +156,25 @@ export const GET: RequestHandler = async ({ request }) => {
 function normalizeText(value: unknown) {
 	if (value === null || value === undefined) return '';
 	return String(value).replace(/\s+/g, ' ').trim();
+}
+
+function containsAny(text: string, words: string[]) {
+	const haystack = normalizeText(text).toLowerCase();
+	return words.some((word) => haystack.includes(word));
+}
+
+function looksLikeRetailer(name: string) {
+	return containsAny(name, RETAILER_TERMS);
+}
+
+function isPrivateLabelBrand(brand: string) {
+	return containsAny(brand, PRIVATE_LABEL_TERMS);
+}
+
+function detectLikelyDomain(text: string): 'food' | 'electronics' | 'unknown' {
+	if (containsAny(text, FOOD_KEYWORDS)) return 'food';
+	if (containsAny(text, ELECTRONICS_KEYWORDS)) return 'electronics';
+	return 'unknown';
 }
 
 function buildScrapeHeaders() {
@@ -197,12 +280,15 @@ function fallbackCorporateResult(barcode: string): OpenRouterCorporateOutput {
 	return {
 		barcode,
 		product_name: `Barcode ${barcode}`,
+		verified_brand: 'UNKNOWN BRAND',
 		brand: 'UNKNOWN BRAND',
 		legal_holding_company: 'UNKNOWN PARENT',
+		holding_company_hq: 'UNKNOWN',
 		country_of_origin: 'UNKNOWN',
 		is_flagged: false,
 		flag_reason: 'Search data is ambiguous; brand identified via internal knowledge.',
 		confidence_score: 0.5,
+		source_attribution: 'Internal_Knowledge',
 		data_sources_used: ['Internal_Knowledge'],
 		parent_company: 'UNKNOWN PARENT',
 		origin_country: 'UNKNOWN',
@@ -235,33 +321,46 @@ async function callOpenRouterAnalyzer(args: {
 	const systemPrompt = `ROLE: Corporate Fact-Checker.
 
 OBJECTIVE:
-- Extract the specific product and brand for barcode ${args.barcode}.
-- Determine the ultimate legal holding company only.
+- Perform high-precision corporate auditing for barcode ${args.barcode}.
+- Resolve conflicts between retailer/distributor listings and manufacturer ownership.
 
-MANDATORY PROCESS:
-1) Identify the product_name and brand using OFF + search snippets.
-2) Collision Error handling: if multiple famous separate brands appear in one snippet, split them into independent entities and pick only the brand matching this barcode.
-3) Ignore retailer names and store chains (e.g., Walmart, Dollar General, Carrefour, Tesco) as holding companies.
-4) Verify parent via internal corporate knowledge; if search snippets conflict with internal knowledge, prioritize verified internal parent mapping.
-5) Return only the ultimate legal holding company (with legal suffix when known).
+DATA HIERARCHY PROTOCOL:
+1) Internal_Knowledge first for confirmed global ownership structures.
+2) GS1_Registry second: if licensee appears to be a retailer/supermarket, treat as Distributor and continue.
+3) Search_Scrape third: extract the true brand from snippet titles/context.
 
-CONSTRAINTS:
-- Never merge competitors unless explicit ownership syntax exists ("subsidiary of", "owned by").
-- Never return a retailer as legal_holding_company.
-- If confidence_score < 0.9, set flag_reason to include exactly: "Search data is ambiguous; brand identified via internal knowledge."
+ANTI-HALLUCINATION FILTERS:
+- STRICT retailer bypass: never output supermarkets/grocery/distributors as legal_holding_company unless verified_brand is a private-label store brand (Great Value, Kirkland, etc.).
+- Barcode squatting check: if data appears mismatched to product type (example: electronics signal for food item), discard mismatched source and rely on better-matching evidence.
+
+COLLISION HANDLING:
+- If sources conflict, explicitly separate entities and pick only the correct manufacturer brand for this barcode.
+- Example logic: OFF says Albert Heijn, Search says SodaStream. Albert Heijn is retailer/distributor; SodaStream is manufacturer; final parent is PepsiCo.
+
+ISRAELI CONNECTION LOGIC:
+- Flag true when there is deep systemic Israeli linkage: headquarters in Israel, major Israeli manufacturing hubs, or 50%+ ownership by Israeli entities.
+- Even with non-Israeli country_of_origin, still flag true when such linkage exists and explain it in flag_reason.
 
 OUTPUT JSON ONLY:
 {
-  "barcode": "string",
-  "product_name": "string",
-  "brand": "string",
-  "legal_holding_company": "string",
-  "country_of_origin": "string",
-  "is_flagged": boolean,
-  "flag_reason": "string",
-  "confidence_score": number,
-  "data_sources_used": ["OFF_API", "Search_Scrape", "Internal_Knowledge"]
-}`;
+	"barcode": "string",
+	"verified_brand": "string",
+	"legal_holding_company": "string",
+	"holding_company_hq": "string",
+	"country_of_origin": "string",
+	"is_flagged": boolean,
+	"flag_reason": "string",
+	"confidence_score": number,
+	"source_attribution": "Internal_Knowledge|GS1_Registry|Search_Scrape",
+	"product_name": "string",
+	"brand": "string",
+	"data_sources_used": ["OFF_API", "Search_Scrape", "Internal_Knowledge"]
+}
+
+HARD RULES:
+- Never output a retailer chain as legal_holding_company unless private-label exception applies.
+- Never merge competitors without explicit ownership evidence.
+- If confidence_score < 0.9, include exactly this sentence in flag_reason: "Search data is ambiguous; brand identified via internal knowledge."`;
 
 	const userPrompt = `BARCODE: ${args.barcode}
 OFF_HINT_PRODUCT: ${offProductName}
@@ -310,11 +409,23 @@ MERGED_CONTEXT:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 				? Math.max(0, Math.min(1, parsed.confidence_score))
 				: 0.82;
 		const productName = normalizeText(parsed.product_name) || offProductName || `Barcode ${args.barcode}`;
-		const brand = normalizeText(parsed.brand) || offBrand || 'UNKNOWN BRAND';
-		const legalHoldingCompany = normalizeText(parsed.legal_holding_company) || 'UNKNOWN PARENT';
+		const brand = normalizeText(parsed.verified_brand || parsed.brand) || offBrand || 'UNKNOWN BRAND';
+		let legalHoldingCompany = normalizeText(parsed.legal_holding_company) || 'UNKNOWN PARENT';
+		const holdingCompanyHq = normalizeText(parsed.holding_company_hq) || 'UNKNOWN';
 		const originCountry = normalizeText(parsed.country_of_origin) || 'UNKNOWN';
 		const ambiguousNote = 'Search data is ambiguous; brand identified via internal knowledge.';
-		const flagReasonRaw = normalizeText(parsed.flag_reason);
+		const sourceAttributionRaw = normalizeText(parsed.source_attribution);
+		const sourceAttribution =
+			sourceAttributionRaw && ['Internal_Knowledge', 'GS1_Registry', 'Search_Scrape'].includes(sourceAttributionRaw)
+				? sourceAttributionRaw
+				: 'Internal_Knowledge';
+		let flagReasonRaw = normalizeText(parsed.flag_reason);
+
+		if (looksLikeRetailer(legalHoldingCompany) && !isPrivateLabelBrand(brand)) {
+			legalHoldingCompany = 'UNKNOWN PARENT';
+			flagReasonRaw = `${flagReasonRaw || 'Retailer/distributor name detected in ownership candidates.'} Retailer was treated as distributor and excluded.`;
+		}
+
 		const flagReason =
 			confidence < 0.9
 				? flagReasonRaw.includes(ambiguousNote)
@@ -339,12 +450,15 @@ MERGED_CONTEXT:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 		return {
 			barcode: args.barcode,
 			product_name: productName,
+			verified_brand: brand,
 			brand,
 			legal_holding_company: legalHoldingCompany,
+			holding_company_hq: holdingCompanyHq,
 			country_of_origin: originCountry,
 			is_flagged: Boolean(parsed.is_flagged),
 			flag_reason: flagReason,
 			confidence_score: confidence,
+			source_attribution: sourceAttribution,
 			data_sources_used: dataSourcesUsed,
 			parent_company: legalHoldingCompany,
 			origin_country: originCountry,
@@ -377,12 +491,15 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 	return {
 		barcode: cached.barcode,
 		product_name: `Barcode ${cached.barcode}`,
+		verified_brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
 		brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
 		legal_holding_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
+		holding_company_hq: 'UNKNOWN',
 		country_of_origin: normalizeText(cached.origin_country) || 'UNKNOWN',
 		is_flagged: Boolean(cached.is_flagged),
 		flag_reason: 'Cached result from Supabase.',
 		confidence_score: 0.95,
+		source_attribution: 'Internal_Knowledge',
 		data_sources_used: ['Internal_Knowledge'],
 		parent_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
 		origin_country: normalizeText(cached.origin_country) || 'UNKNOWN',
@@ -418,12 +535,15 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		return {
 			barcode,
 			product_name: `Barcode ${barcode}`,
+			verified_brand: 'SYSTEM PREFIX',
 			brand: 'SYSTEM PREFIX',
 			legal_holding_company: 'UNKNOWN PARENT',
+			holding_company_hq: 'Israel',
 			country_of_origin: 'Israel',
 			is_flagged: true,
 			flag_reason: 'Barcode starts with 729, treated as GS1 Israeli hard-stop.',
 			confidence_score: 1,
+			source_attribution: 'GS1_Registry',
 			data_sources_used: ['Internal_Knowledge'],
 			parent_company: 'UNKNOWN PARENT',
 			origin_country: 'Israel',
@@ -437,7 +557,8 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	}
 
 	const offLookup = await lookupOpenFoodFactsProduct(barcode).catch(() => ({ product: null, statusCode: 0 }));
-	const offContext = offLookup.product ? buildOpenFoodFactsContext(offLookup.product) : '';
+	let offProduct = offLookup.product;
+	let offContext = offProduct ? buildOpenFoodFactsContext(offProduct) : '';
 	const scrape = await semanticGoogleScrape(barcode).catch(() => ({
 		blocked: true,
 		hasContext: false,
@@ -445,9 +566,21 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		contextText: ''
 	}));
 
+	const offDomain = detectLikelyDomain(offContext);
+	const scrapeDomain = detectLikelyDomain(scrape.contextText);
+	if (
+		offProduct &&
+		offDomain !== 'unknown' &&
+		scrapeDomain !== 'unknown' &&
+		offDomain !== scrapeDomain
+	) {
+		offProduct = null;
+		offContext = '';
+	}
+
 	const mergedContext = [offContext, scrape.contextText].filter(Boolean).join('\n\n');
 	const sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'> = [];
-	if (offLookup.product) sourcesUsed.push('OFF_API');
+	if (offProduct) sourcesUsed.push('OFF_API');
 	if (scrape.hasContext) sourcesUsed.push('Search_Scrape');
 	if (sourcesUsed.length === 0 || offLookup.statusCode === 404 || offLookup.statusCode === 406) {
 		sourcesUsed.push('Internal_Knowledge');
@@ -456,7 +589,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const ai = await callOpenRouterAnalyzer({
 		barcode,
 		contextText: mergedContext,
-		offProduct: offLookup.product,
+		offProduct,
 		sourcesUsed
 	});
 
