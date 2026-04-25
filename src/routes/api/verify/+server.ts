@@ -1,4 +1,4 @@
-import { json, error } from '@sveltejs/kit';
+import { json } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import * as cheerio from 'cheerio';
 import type { RequestHandler } from './$types';
@@ -32,6 +32,31 @@ const BROWSER_ACCEPT_HEADER =
 	'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
 const GOOGLE_MOBILE_USER_AGENT =
 	'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
+const ALLOWED_ORIGINS = new Set([
+	'https://localhost',
+	'http://localhost',
+	'http://localhost:5173',
+	'capacitor://localhost',
+	'https://isfake-app.onrender.com'
+]);
+
+function corsHeaders(origin: string | null) {
+	const allowOrigin = origin && ALLOWED_ORIGINS.has(origin) ? origin : 'https://localhost';
+
+	return {
+		'Access-Control-Allow-Origin': allowOrigin,
+		'Access-Control-Allow-Methods': 'POST, OPTIONS',
+		'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+		Vary: 'Origin'
+	};
+}
+
+export const OPTIONS: RequestHandler = async ({ request }) => {
+	return new Response(null, {
+		status: 204,
+		headers: corsHeaders(request.headers.get('origin'))
+	});
+};
 
 function normalizeText(value: string | null | undefined) {
 	return (value ?? '').replace(/\s+/g, ' ').trim();
@@ -402,16 +427,17 @@ async function robustScan(barcode: string) {
 }
 
 export const POST: RequestHandler = async ({ request }) => {
+	const headers = corsHeaders(request.headers.get('origin'));
 	const body = (await request.json().catch(() => ({}))) as VerifyBody;
 	const barcode = body.barcode?.trim();
 
 	if (!barcode) {
-		throw error(400, 'barcode is required');
+		return json({ error: 'barcode is required' }, { status: 400, headers });
 	}
 
 	if (body.action === 'verify' || body.action === 'correct') {
 		if (typeof body.is_israeli !== 'boolean') {
-			throw error(400, 'is_israeli is required for votes');
+			return json({ error: 'is_israeli is required for votes' }, { status: 400, headers });
 		}
 
 		const result = await voteOnBarcode({
@@ -425,9 +451,9 @@ export const POST: RequestHandler = async ({ request }) => {
 			confidence: body.confidence
 		});
 
-		return json(result);
+		return json(result, { headers });
 	}
 
 	const result = await robustScan(barcode);
-	return json(result);
+	return json(result, { headers });
 };
