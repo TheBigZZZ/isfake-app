@@ -49,11 +49,11 @@
 			<div class="grid gap-2 sm:grid-cols-2">
 				<div class="rounded-2xl border border-white/10 bg-black/20 px-3 py-2.5">
 					<p class="text-[10px] uppercase tracking-[0.18em] text-white/45">Parent company</p>
-					<p class="mt-1 break-words text-sm text-white">{result.parent_company}</p>
+					<p class="mt-1 wrap-break-word text-sm text-white">{result.parent_company}</p>
 				</div>
 				<div class="rounded-2xl border border-white/10 bg-black/20 px-3 py-2.5">
 					<p class="text-[10px] uppercase tracking-[0.18em] text-white/45">Origin country</p>
-					<p class="mt-1 break-words text-sm text-white">{result.origin_country}</p>
+					<p class="mt-1 wrap-break-word text-sm text-white">{result.origin_country}</p>
 				</div>
 			</div>
 

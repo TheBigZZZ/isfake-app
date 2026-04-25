@@ -9,11 +9,28 @@ type VerifyBody = {
 	action?: 'scan';
 };
 
-type OpenRouterAnalysisOutput = {
+type OpenFoodFactsProduct = {
+	product_name?: string;
+	brands?: string;
+	brand_owner?: string;
+	generic_name?: string;
+	categories?: string;
+	countries?: string;
+	ingredients_text?: string;
+};
+
+type OpenRouterCorporateOutput = {
+	barcode: string;
+	product_name: string;
 	brand: string;
+	legal_holding_company: string;
+	country_of_origin: string;
+	is_flagged: boolean;
+	flag_reason: string;
+	confidence_score: number;
+	data_sources_used: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'>;
 	parent_company: string;
 	origin_country: string;
-	is_flagged: boolean;
 	reasoning: string;
 };
 
@@ -21,10 +38,12 @@ type CachedProductRow = {
 	barcode: string;
 	brand: string;
 	parent_company: string;
+	origin_country: string;
 	is_flagged: boolean;
 };
 
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPEN_FOOD_FACTS_API_URL = 'https://world.openfoodfacts.org/api/v2/product';
 const OPENROUTER_MODEL = env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-001';
 const BROWSER_ACCEPT_HEADER =
 	'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
@@ -106,6 +125,41 @@ function extractJsonObject(rawText: string) {
 	return candidate.slice(start, end + 1);
 }
 
+function buildOpenFoodFactsContext(product: OpenFoodFactsProduct) {
+	return [
+		`OFF product_name: ${normalizeText(product.product_name) || 'UNKNOWN'}`,
+		`OFF brand(s): ${normalizeText(product.brands) || normalizeText(product.brand_owner) || 'UNKNOWN'}`,
+		`OFF generic_name: ${normalizeText(product.generic_name) || 'UNKNOWN'}`,
+		`OFF categories: ${normalizeText(product.categories) || 'UNKNOWN'}`,
+		`OFF countries: ${normalizeText(product.countries) || 'UNKNOWN'}`,
+		`OFF ingredients_text: ${normalizeText(product.ingredients_text) || 'UNKNOWN'}`
+	].join('\n');
+}
+
+async function lookupOpenFoodFactsProduct(barcode: string) {
+	const response = await fetch(`${OPEN_FOOD_FACTS_API_URL}/${encodeURIComponent(barcode)}.json`, {
+		headers: {
+			Accept: 'application/json',
+			'User-Agent': GOOGLE_MOBILE_USER_AGENT
+		}
+	});
+
+	if (!response.ok) {
+		return { product: null, statusCode: response.status };
+	}
+
+	const payload = (await response.json()) as {
+		status?: number;
+		product?: OpenFoodFactsProduct;
+	};
+
+	if (payload.status !== 1 || !payload.product) {
+		return { product: null, statusCode: response.status };
+	}
+
+	return { product: payload.product, statusCode: response.status };
+}
+
 async function semanticGoogleScrape(barcode: string) {
 	const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(`barcode ${barcode}`)}&hl=en&gl=us&num=10&pws=0`;
 	const response = await fetch(searchUrl, {
@@ -119,14 +173,8 @@ async function semanticGoogleScrape(barcode: string) {
 	const $ = cheerio.load(html);
 
 	const h3Records = $('h3')
-		.slice(0, 3)
-		.map((_, element) => {
-			const h3 = $(element);
-			const titleText = normalizeText(h3.text());
-			const anchor = h3.closest('a');
-			const anchorText = normalizeText(anchor.text());
-			return normalizeText(`${titleText} ${anchorText}`);
-		})
+		.slice(0, 5)
+		.map((_, element) => normalizeText($(element).text()))
 		.get()
 		.filter(Boolean);
 
@@ -145,45 +193,81 @@ async function semanticGoogleScrape(barcode: string) {
 	};
 }
 
-function neutralFallback(barcode: string) {
+function fallbackCorporateResult(barcode: string): OpenRouterCorporateOutput {
 	return {
 		barcode,
+		product_name: `Barcode ${barcode}`,
 		brand: 'UNKNOWN BRAND',
+		legal_holding_company: 'UNKNOWN PARENT',
+		country_of_origin: 'UNKNOWN',
+		is_flagged: false,
+		flag_reason: 'Search data is ambiguous; brand identified via internal knowledge.',
+		confidence_score: 0.5,
+		data_sources_used: ['Internal_Knowledge'],
 		parent_company: 'UNKNOWN PARENT',
 		origin_country: 'UNKNOWN',
-		is_flagged: false,
-		reasoning: 'No reliable analysis was available, so the result was left unflagged.'
+		reasoning: 'Search data is ambiguous; brand identified via internal knowledge.'
 	};
 }
 
-async function callOpenRouterAnalyzer(args: { barcode: string; contextText: string }): Promise<OpenRouterAnalysisOutput> {
+async function callOpenRouterAnalyzer(args: {
+	barcode: string;
+	contextText: string;
+	offProduct: OpenFoodFactsProduct | null;
+	sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'>;
+}): Promise<OpenRouterCorporateOutput> {
 	if (!env.OPENROUTER_API_KEY) {
-		const fallback = neutralFallback(args.barcode);
+		const fallback = fallbackCorporateResult(args.barcode);
 		return {
-			brand: fallback.brand,
-			parent_company: fallback.parent_company,
-			origin_country: fallback.origin_country,
-			is_flagged: fallback.is_flagged,
-			reasoning: `${fallback.reasoning} (OPENROUTER_API_KEY missing, using local fallback).`
+			...fallback,
+			flag_reason: `${fallback.flag_reason} (OPENROUTER_API_KEY missing, using local fallback).`,
+			reasoning: `${fallback.reasoning} (OPENROUTER_API_KEY missing, using local fallback).`,
+			data_sources_used: args.sourcesUsed.includes('Internal_Knowledge')
+				? args.sourcesUsed
+				: [...args.sourcesUsed, 'Internal_Knowledge']
 		};
 	}
 
-	const prompt = `You are a global corporate analyst. Given a barcode ${args.barcode} and search text, identify the brand. Do not apply any regional priority filters.
+	const offProductName = normalizeText(args.offProduct?.product_name) || 'UNKNOWN';
+	const offBrand =
+		normalizeText(args.offProduct?.brands) || normalizeText(args.offProduct?.brand_owner) || 'UNKNOWN';
 
-Always trace the brand to its ultimate parent company.
+	const systemPrompt = `ROLE: Corporate Fact-Checker.
 
-If the search text identifies a retailer but the barcode belongs to a manufacturer, prioritize the manufacturer as the brand.
+OBJECTIVE:
+- Extract the specific product and brand for barcode ${args.barcode}.
+- Determine the ultimate legal holding company only.
 
-Return only JSON with this exact shape:
-{ "brand": "string", "parent_company": "string", "origin_country": "string", "is_flagged": boolean, "reasoning": "string" }
+MANDATORY PROCESS:
+1) Identify the product_name and brand using OFF + search snippets.
+2) Collision Error handling: if multiple famous separate brands appear in one snippet, split them into independent entities and pick only the brand matching this barcode.
+3) Ignore retailer names and store chains (e.g., Walmart, Dollar General, Carrefour, Tesco) as holding companies.
+4) Verify parent via internal corporate knowledge; if search snippets conflict with internal knowledge, prioritize verified internal parent mapping.
+5) Return only the ultimate legal holding company (with legal suffix when known).
 
-Guidance:
-- Use "UNKNOWN BRAND", "UNKNOWN PARENT", and "UNKNOWN" when evidence is insufficient.
-- Set "is_flagged" to true only when the evidence supports Israeli ownership or control.
-- Do not apply regional priority prefix rules.
-- No markdown. JSON only.
+CONSTRAINTS:
+- Never merge competitors unless explicit ownership syntax exists ("subsidiary of", "owned by").
+- Never return a retailer as legal_holding_company.
+- If confidence_score < 0.9, set flag_reason to include exactly: "Search data is ambiguous; brand identified via internal knowledge."
 
-Search Text:\n${args.contextText || 'EMPTY_CONTEXT'}`;
+OUTPUT JSON ONLY:
+{
+  "barcode": "string",
+  "product_name": "string",
+  "brand": "string",
+  "legal_holding_company": "string",
+  "country_of_origin": "string",
+  "is_flagged": boolean,
+  "flag_reason": "string",
+  "confidence_score": number,
+  "data_sources_used": ["OFF_API", "Search_Scrape", "Internal_Knowledge"]
+}`;
+
+	const userPrompt = `BARCODE: ${args.barcode}
+OFF_HINT_PRODUCT: ${offProductName}
+OFF_HINT_BRAND: ${offBrand}
+
+MERGED_CONTEXT:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 
 	const response = await fetch(OPENROUTER_API_URL, {
 		method: 'POST',
@@ -191,31 +275,26 @@ Search Text:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 			Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
 			'Content-Type': 'application/json',
 			'HTTP-Referer': env.OPENROUTER_REFERER || 'http://localhost:5173',
-			'X-Title': env.OPENROUTER_TITLE || 'Global Brand Trace'
+			'X-Title': env.OPENROUTER_TITLE || 'Corporate Fact Checker'
 		}),
 		body: JSON.stringify({
 			model: OPENROUTER_MODEL,
-			temperature: 0.1,
+			temperature: 0.05,
 			response_format: { type: 'json_object' },
 			messages: [
-				{
-					role: 'system',
-					content:
-						'Return only valid JSON. Do not wrap in markdown. Keep analysis concise and evidence-focused.'
-				},
-				{ role: 'user', content: prompt }
+				{ role: 'system', content: systemPrompt },
+				{ role: 'user', content: userPrompt }
 			]
 		})
 	});
 
 	if (!response.ok) {
-		const fallback = neutralFallback(args.barcode);
+		const fallback = fallbackCorporateResult(args.barcode);
 		return {
-			brand: fallback.brand,
-			parent_company: fallback.parent_company,
-			origin_country: fallback.origin_country,
-			is_flagged: fallback.is_flagged,
-			reasoning: `${fallback.reasoning} (OpenRouter ${response.status} fallback).`
+			...fallback,
+			flag_reason: `${fallback.flag_reason} (OpenRouter ${response.status} fallback).`,
+			reasoning: `${fallback.reasoning} (OpenRouter ${response.status} fallback).`,
+			data_sources_used: args.sourcesUsed
 		};
 	}
 
@@ -225,35 +304,69 @@ Search Text:\n${args.contextText || 'EMPTY_CONTEXT'}`;
 	const content = payload.choices?.[0]?.message?.content ?? '';
 
 	try {
-		const parsed = JSON.parse(extractJsonObject(content)) as Partial<OpenRouterAnalysisOutput>;
+		const parsed = JSON.parse(extractJsonObject(content)) as Partial<OpenRouterCorporateOutput>;
+		const confidence =
+			typeof parsed.confidence_score === 'number'
+				? Math.max(0, Math.min(1, parsed.confidence_score))
+				: 0.82;
+		const productName = normalizeText(parsed.product_name) || offProductName || `Barcode ${args.barcode}`;
+		const brand = normalizeText(parsed.brand) || offBrand || 'UNKNOWN BRAND';
+		const legalHoldingCompany = normalizeText(parsed.legal_holding_company) || 'UNKNOWN PARENT';
+		const originCountry = normalizeText(parsed.country_of_origin) || 'UNKNOWN';
+		const ambiguousNote = 'Search data is ambiguous; brand identified via internal knowledge.';
+		const flagReasonRaw = normalizeText(parsed.flag_reason);
+		const flagReason =
+			confidence < 0.9
+				? flagReasonRaw.includes(ambiguousNote)
+					? flagReasonRaw
+					: `${flagReasonRaw || 'Low-confidence result.'} ${ambiguousNote}`
+				: flagReasonRaw || 'Corporate ownership assessment completed.';
+
+		const normalizedSources = Array.isArray(parsed.data_sources_used)
+			? parsed.data_sources_used
+					.map((s) => normalizeText(s).toUpperCase())
+					.map((s) => {
+						if (s === 'OFF_API') return 'OFF_API' as const;
+						if (s === 'SEARCH_SCRAPE') return 'Search_Scrape' as const;
+						if (s === 'INTERNAL_KNOWLEDGE') return 'Internal_Knowledge' as const;
+						return null;
+					})
+					.filter((s): s is 'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge' => Boolean(s))
+			: [];
+
+		const dataSourcesUsed = normalizedSources.length > 0 ? normalizedSources : args.sourcesUsed;
 
 		return {
-			brand: normalizeText(parsed.brand) || 'UNKNOWN BRAND',
-			parent_company: normalizeText(parsed.parent_company) || 'UNKNOWN PARENT',
-			origin_country: normalizeText(parsed.origin_country) || 'UNKNOWN',
+			barcode: args.barcode,
+			product_name: productName,
+			brand,
+			legal_holding_company: legalHoldingCompany,
+			country_of_origin: originCountry,
 			is_flagged: Boolean(parsed.is_flagged),
-			reasoning:
-				normalizeText(parsed.reasoning) ||
-				'AI returned JSON without an explicit explanation; defaulted to a conservative interpretation.'
+			flag_reason: flagReason,
+			confidence_score: confidence,
+			data_sources_used: dataSourcesUsed,
+			parent_company: legalHoldingCompany,
+			origin_country: originCountry,
+			reasoning: flagReason
 		};
 	} catch {
-		const fallback = neutralFallback(args.barcode);
+		const fallback = fallbackCorporateResult(args.barcode);
 		return {
-			brand: fallback.brand,
-			parent_company: fallback.parent_company,
-			origin_country: fallback.origin_country,
-			is_flagged: fallback.is_flagged,
-			reasoning: `${fallback.reasoning} (JSON parse fallback).`
+			...fallback,
+			flag_reason: `${fallback.flag_reason} (JSON parse fallback).`,
+			reasoning: `${fallback.reasoning} (JSON parse fallback).`,
+			data_sources_used: args.sourcesUsed
 		};
 	}
 }
 
-async function loadCachedProduct(barcode: string) {
+async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOutput | null> {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const adminSupabase = getAdminSupabase() as any;
 	const { data } = await adminSupabase
 		.from('products')
-		.select('barcode,brand,parent_company,is_flagged')
+		.select('barcode,brand,parent_company,origin_country,is_flagged')
 		.eq('barcode', barcode)
 		.maybeSingle();
 
@@ -263,10 +376,16 @@ async function loadCachedProduct(barcode: string) {
 
 	return {
 		barcode: cached.barcode,
-		brand: cached.brand,
-		parent_company: cached.parent_company,
-		origin_country: 'UNKNOWN',
+		product_name: `Barcode ${cached.barcode}`,
+		brand: normalizeText(cached.brand) || 'UNKNOWN BRAND',
+		legal_holding_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
+		country_of_origin: normalizeText(cached.origin_country) || 'UNKNOWN',
 		is_flagged: Boolean(cached.is_flagged),
+		flag_reason: 'Cached result from Supabase.',
+		confidence_score: 0.95,
+		data_sources_used: ['Internal_Knowledge'],
+		parent_company: normalizeText(cached.parent_company) || 'UNKNOWN PARENT',
+		origin_country: normalizeText(cached.origin_country) || 'UNKNOWN',
 		reasoning: 'Cached result from Supabase.'
 	};
 }
@@ -274,7 +393,8 @@ async function loadCachedProduct(barcode: string) {
 async function cacheScanResult(result: {
 	barcode: string;
 	brand: string;
-	parent_company: string;
+	legal_holding_company: string;
+	country_of_origin: string;
 	is_flagged: boolean;
 }) {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -284,7 +404,8 @@ async function cacheScanResult(result: {
 		{
 			barcode: result.barcode,
 			brand: result.brand,
-			parent_company: result.parent_company,
+			parent_company: result.legal_holding_company,
+			origin_country: result.country_of_origin,
 			is_flagged: result.is_flagged,
 			updated_at: new Date().toISOString()
 		},
@@ -292,15 +413,21 @@ async function cacheScanResult(result: {
 	);
 }
 
-async function robustScan(barcode: string) {
+async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	if (barcode.startsWith('729')) {
 		return {
 			barcode,
+			product_name: `Barcode ${barcode}`,
 			brand: 'SYSTEM PREFIX',
+			legal_holding_company: 'UNKNOWN PARENT',
+			country_of_origin: 'Israel',
+			is_flagged: true,
+			flag_reason: 'Barcode starts with 729, treated as GS1 Israeli hard-stop.',
+			confidence_score: 1,
+			data_sources_used: ['Internal_Knowledge'],
 			parent_company: 'UNKNOWN PARENT',
 			origin_country: 'Israel',
-			is_flagged: true,
-			reasoning: 'Barcode starts with 729, so this is treated as a hard-stop Israeli prefix result.'
+			reasoning: 'Barcode starts with 729, treated as GS1 Israeli hard-stop.'
 		};
 	}
 
@@ -309,6 +436,8 @@ async function robustScan(barcode: string) {
 		return cached;
 	}
 
+	const offLookup = await lookupOpenFoodFactsProduct(barcode).catch(() => ({ product: null, statusCode: 0 }));
+	const offContext = offLookup.product ? buildOpenFoodFactsContext(offLookup.product) : '';
 	const scrape = await semanticGoogleScrape(barcode).catch(() => ({
 		blocked: true,
 		hasContext: false,
@@ -316,23 +445,30 @@ async function robustScan(barcode: string) {
 		contextText: ''
 	}));
 
+	const mergedContext = [offContext, scrape.contextText].filter(Boolean).join('\n\n');
+	const sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'> = [];
+	if (offLookup.product) sourcesUsed.push('OFF_API');
+	if (scrape.hasContext) sourcesUsed.push('Search_Scrape');
+	if (sourcesUsed.length === 0 || offLookup.statusCode === 404 || offLookup.statusCode === 406) {
+		sourcesUsed.push('Internal_Knowledge');
+	}
+
 	const ai = await callOpenRouterAnalyzer({
 		barcode,
-		contextText: scrape.contextText
+		contextText: mergedContext,
+		offProduct: offLookup.product,
+		sourcesUsed
 	});
 
-	const result = {
-		barcode,
+	await cacheScanResult({
+		barcode: ai.barcode,
 		brand: ai.brand,
-		parent_company: ai.parent_company,
-		origin_country: ai.origin_country,
-		is_flagged: ai.is_flagged,
-		reasoning: ai.reasoning
-	};
+		legal_holding_company: ai.legal_holding_company,
+		country_of_origin: ai.country_of_origin,
+		is_flagged: ai.is_flagged
+	});
 
-	await cacheScanResult(result);
-
-	return result;
+	return ai;
 }
 
 export const POST: RequestHandler = async ({ request }) => {
