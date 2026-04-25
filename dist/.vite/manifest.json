@@ -1,6 +1,6 @@
 {
   ".svelte-kit/generated/client-optimized/app.js": {
-    "file": "_app/immutable/entry/app.B4MM7UBt.js",
+    "file": "_app/immutable/entry/app.OSIFijP6.js",
     "name": "entry/app",
     "src": ".svelte-kit/generated/client-optimized/app.js",
     "isEntry": true,
@@ -30,12 +30,12 @@
     ]
   },
   ".svelte-kit/generated/client-optimized/nodes/1.js": {
-    "file": "_app/immutable/nodes/1.CKvX5S8H.js",
+    "file": "_app/immutable/nodes/1.DX7rs1-v.js",
     "name": "nodes/1",
     "src": ".svelte-kit/generated/client-optimized/nodes/1.js",
     "isEntry": true,
     "imports": [
-      "_DS9mxkIT.js",
+      "_fUQkOfK3.js",
       "_CzTzyPtj.js",
       "_DXLwiZ0H.js"
     ]
@@ -72,13 +72,6 @@
       "_ByPWl-Qi.js"
     ]
   },
-  "_DS9mxkIT.js": {
-    "file": "_app/immutable/chunks/DS9mxkIT.js",
-    "name": "client",
-    "imports": [
-      "_CzTzyPtj.js"
-    ]
-  },
   "_DXLwiZ0H.js": {
     "file": "_app/immutable/chunks/DXLwiZ0H.js",
     "name": "disclose-version"
@@ -92,6 +85,13 @@
     "name": "definitions",
     "imports": [
       "_ByPWl-Qi.js"
+    ]
+  },
+  "_fUQkOfK3.js": {
+    "file": "_app/immutable/chunks/fUQkOfK3.js",
+    "name": "client",
+    "imports": [
+      "_CzTzyPtj.js"
     ]
   },
   "node_modules/@capacitor/app/dist/esm/web.js": {
@@ -114,12 +114,12 @@
     ]
   },
   "node_modules/@sveltejs/kit/src/runtime/client/entry.js": {
-    "file": "_app/immutable/entry/start.TAccMLKd.js",
+    "file": "_app/immutable/entry/start.I9rPWQR4.js",
     "name": "entry/start",
     "src": "node_modules/@sveltejs/kit/src/runtime/client/entry.js",
     "isEntry": true,
     "imports": [
-      "_DS9mxkIT.js"
+      "_fUQkOfK3.js"
     ]
   }
 }

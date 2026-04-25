@@ -515,32 +515,38 @@ async function robustScan(barcode: string) {
 
 export const POST: RequestHandler = async ({ request }) => {
 	const headers = corsHeaders(request.headers.get('origin'));
-	const body = (await request.json().catch(() => ({}))) as VerifyBody;
-	const barcode = body.barcode?.trim();
+	try {
+		const body = (await request.json().catch(() => ({}))) as VerifyBody;
+		const barcode = body.barcode?.trim();
 
-	if (!barcode) {
-		return json({ error: 'barcode is required' }, { status: 400, headers });
-	}
-
-	if (body.action === 'verify' || body.action === 'correct') {
-		if (typeof body.is_israeli !== 'boolean') {
-			return json({ error: 'is_israeli is required for votes' }, { status: 400, headers });
+		if (!barcode) {
+			return json({ error: 'barcode is required' }, { status: 400, headers });
 		}
 
-		const result = await voteOnBarcode({
-			barcode,
-			isIsraeli: body.is_israeli,
-			voteAction: body.action as VoteAction,
-			name: body.name,
-			brand: body.brand,
-			contextText: body.context_text,
-			reasoning: body.reasoning,
-			confidence: body.confidence
-		});
+		if (body.action === 'verify' || body.action === 'correct') {
+			if (typeof body.is_israeli !== 'boolean') {
+				return json({ error: 'is_israeli is required for votes' }, { status: 400, headers });
+			}
 
+			const result = await voteOnBarcode({
+				barcode,
+				isIsraeli: body.is_israeli,
+				voteAction: body.action as VoteAction,
+				name: body.name,
+				brand: body.brand,
+				contextText: body.context_text,
+				reasoning: body.reasoning,
+				confidence: body.confidence
+			});
+
+			return json(result, { headers });
+		}
+
+		const result = await robustScan(barcode);
 		return json(result, { headers });
+	} catch (error) {
+		const message = error instanceof Error ? error.message : 'Internal server error';
+		console.error('[verify] POST failed', error);
+		return json({ error: message }, { status: 500, headers });
 	}
-
-	const result = await robustScan(barcode);
-	return json(result, { headers });
 };
