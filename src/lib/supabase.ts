@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import type { VerificationResult, VoteAction } from '$lib/verification';
+import type { VerificationResult } from '$lib/verification';
 
 // TODO: Replace with your projected Supabase URL and Anon Key
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://placeholder.supabase.co';
@@ -38,26 +38,4 @@ async function postVerificationRequest(body: Record<string, unknown>): Promise<V
 
 export async function verifyBarcode(barcode: string) {
 	return postVerificationRequest({ barcode, action: 'scan' });
-}
-
-export async function submitBarcodeVote(args: {
-	barcode: string;
-	voteAction: VoteAction;
-	is_israeli: boolean;
-	name?: string;
-	brand?: string;
-	context_text?: string;
-	reasoning?: string;
-	confidence?: number;
-}) {
-	return postVerificationRequest({
-		barcode: args.barcode,
-		action: args.voteAction,
-		is_israeli: args.is_israeli,
-		name: args.name,
-		brand: args.brand,
-		context_text: args.context_text,
-		reasoning: args.reasoning,
-		confidence: args.confidence
-	});
 }

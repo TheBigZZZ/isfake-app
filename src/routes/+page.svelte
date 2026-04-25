@@ -3,14 +3,13 @@
   import { CapacitorBarcodeScanner } from "@capacitor/barcode-scanner";
   import { App } from "@capacitor/app";
   import VerificationCard from "$lib/components/VerificationCard.svelte";
-  import { submitBarcodeVote, verifyBarcode } from "$lib/supabase";
-  import type { VerificationResult, VoteAction } from "$lib/verification";
+  import { verifyBarcode } from "$lib/supabase";
+  import type { VerificationResult } from "$lib/verification";
 
   let isScanning = $state(false);
   let manualInput = $state("");
-  let scanResult = $state<string | null>(null);
   let evaluation = $state<VerificationResult | null>(null);
-  let currentAction = $state<"idle" | "scanning" | "checking" | "voting">("idle");
+  let currentAction = $state<"idle" | "scanning" | "checking">("idle");
   let errorMessage = $state<string | null>(null);
 
   onMount(() => {
@@ -20,7 +19,6 @@
         currentAction = "idle";
       } else if (evaluation !== null) {
         evaluation = null;
-        scanResult = null;
       } else {
         App.exitApp();
       }
@@ -32,7 +30,6 @@
     if (!barcode) return;
     currentAction = "checking";
     errorMessage = null;
-    scanResult = barcode;
     evaluation = null;
     try {
       evaluation = await verifyBarcode(barcode);
@@ -44,36 +41,9 @@
     }
   };
 
-  const handleVote = async (voteAction: VoteAction, result: VerificationResult) => {
-    if (!scanResult) return;
-
-    currentAction = "voting";
-    errorMessage = null;
-
-    const targetIsIsraeli = voteAction === "verify" ? result.is_israeli : !result.is_israeli;
-
-    try {
-      evaluation = await submitBarcodeVote({
-        barcode: scanResult,
-        voteAction,
-        is_israeli: targetIsIsraeli,
-        name: result.name,
-        brand: result.brand,
-        context_text: result.context_text,
-        reasoning: result.reasoning,
-        confidence: result.confidence
-      });
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : "Vote submission failed.";
-    } finally {
-      currentAction = "idle";
-    }
-  };
-
   const startScan = async () => {
     isScanning = true;
     currentAction = "scanning";
-    scanResult = null;
     evaluation = null;
 
     try {
@@ -102,7 +72,6 @@
 
   const reset = () => {
     evaluation = null;
-    scanResult = null;
     manualInput = "";
     currentAction = "idle";
     errorMessage = null;
@@ -114,7 +83,7 @@
 
   <header class="relative z-10 shrink-0 px-4 pb-3 pt-5">
     <div class="mx-auto flex w-full max-w-md items-center justify-between gap-2">
-      <h1 class="font-[Fraunces,serif] text-2xl leading-none text-amber-100">Israel Checker</h1>
+      <h1 class="font-[Fraunces,serif] text-2xl leading-none text-amber-100">Global Brand Trace</h1>
       <span class="rounded-full border border-amber-900/60 bg-amber-950/40 px-2.5 py-1 text-[10px] uppercase tracking-[0.14em] text-amber-200/80">
         mobile
       </span>
@@ -166,10 +135,10 @@
       {#if currentAction === "checking"}
         <div class="grid place-items-center rounded-3xl border border-slate-700/70 bg-slate-900/90 px-4 py-10 text-center shadow-[0_18px_45px_rgba(0,0,0,0.32)]">
           <div class="h-10 w-10 animate-spin rounded-full border-2 border-slate-700 border-t-amber-300"></div>
-            <p class="mt-4 text-sm text-slate-300">Scraping search context and asking the model to reason about ownership...</p>
+            <p class="mt-4 text-sm text-slate-300">Tracing brand ownership and origin country from search context...</p>
         </div>
         {:else if evaluation}
-          <VerificationCard result={evaluation} voting={currentAction === "voting"} onVote={handleVote} />
+          <VerificationCard result={evaluation} />
           <button
             class="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm font-medium text-slate-100 transition active:scale-[0.99]"
             onclick={reset}
