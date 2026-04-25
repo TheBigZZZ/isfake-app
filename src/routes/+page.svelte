@@ -78,33 +78,37 @@
   };
 </script>
 
-<main class="relative flex h-full min-h-0 w-full flex-col overflow-hidden bg-linear-to-b from-slate-950 via-slate-900 to-slate-950">
-  <div class="pointer-events-none absolute inset-0 opacity-40 [background:radial-gradient(90%_50%_at_20%_0%,rgba(245,158,11,0.18),transparent_65%)]"></div>
+<main class="relative flex h-full min-h-0 w-full flex-col overflow-hidden">
+  <div class="pointer-events-none absolute inset-0 opacity-60 animate-float-slow [background:radial-gradient(70%_45%_at_18%_12%,rgba(56,189,248,0.20),transparent_60%),radial-gradient(60%_40%_at_85%_10%,rgba(96,165,250,0.14),transparent_55%)]"></div>
+  <div class="pointer-events-none absolute inset-x-0 top-0 h-28 bg-linear-to-b from-sky-300/10 to-transparent"></div>
 
-  <header class="relative z-10 shrink-0 px-4 pb-3 pt-5">
-    <div class="mx-auto flex w-full max-w-md items-center justify-between gap-2">
-      <h1 class="font-[Fraunces,serif] text-2xl leading-none text-amber-100">Global Brand Trace</h1>
-      <span class="rounded-full border border-amber-900/60 bg-amber-950/40 px-2.5 py-1 text-[10px] uppercase tracking-[0.14em] text-amber-200/80">
-        mobile
+  <header class="relative z-10 shrink-0 px-4 pb-4 pt-5 animate-fade-up">
+    <div class="mx-auto flex w-full max-w-md items-center justify-between gap-3">
+      <div class="space-y-1">
+        <p class="text-[10px] font-semibold uppercase tracking-[0.34em] text-sky-200/70">Corporate audit scanner</p>
+        <h1 class="font-[Fraunces,serif] text-3xl leading-none text-white">IsFake</h1>
+      </div>
+      <span class="rounded-full border border-sky-300/30 bg-sky-400/10 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-sky-100/80 shadow-[0_0_24px_rgba(56,189,248,0.10)]">
+        live
       </span>
     </div>
   </header>
 
   <section class="relative z-10 min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
-    <div class="mx-auto flex w-full max-w-md flex-col gap-4 px-4 pb-4 pt-1">
-      <div class:hidden={isScanning} class="rounded-3xl border border-slate-700/70 bg-slate-900/90 p-4 shadow-[0_18px_45px_rgba(0,0,0,0.32)] backdrop-blur">
+    <div class="mx-auto flex w-full max-w-md flex-col gap-4 px-4 pb-6 pt-1">
+      <div class:hidden={isScanning} class="rounded-[1.75rem] border border-sky-300/15 bg-slate-950/70 p-4 shadow-[0_24px_60px_rgba(3,10,22,0.55)] backdrop-blur-xl animate-fade-up-1">
         <button
-          class="w-full rounded-2xl bg-amber-300 px-4 py-3.5 text-sm font-semibold text-slate-950 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-500"
+          class="w-full rounded-2xl border border-sky-300/25 bg-linear-to-r from-sky-500 to-cyan-400 px-4 py-3.5 text-sm font-semibold text-slate-950 shadow-[0_16px_36px_rgba(56,189,248,0.25)] transition duration-200 ease-out hover:translate-y-[-1px] hover:shadow-[0_20px_44px_rgba(56,189,248,0.32)] active:scale-[0.99] disabled:cursor-not-allowed disabled:from-slate-700 disabled:to-slate-700 disabled:text-slate-500"
           onclick={startScan}
           disabled={currentAction !== "idle"}
         >
           {currentAction === "scanning" ? "Scanning..." : "Scan Product Barcode"}
         </button>
 
-        <div class="my-4 flex items-center gap-2 text-[11px] uppercase tracking-[0.14em] text-slate-500">
-          <span class="h-px flex-1 bg-slate-800"></span>
+        <div class="my-4 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-sky-100/40">
+          <span class="h-px flex-1 bg-linear-to-r from-transparent via-sky-200/25 to-transparent"></span>
           <span>or enter manually</span>
-          <span class="h-px flex-1 bg-slate-800"></span>
+          <span class="h-px flex-1 bg-linear-to-r from-transparent via-sky-200/25 to-transparent"></span>
         </div>
 
         <form class="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto]" onsubmit={handleManualSubmit}>
@@ -113,12 +117,12 @@
             inputmode="numeric"
             bind:value={manualInput}
             placeholder="Barcode number"
-            class="min-w-0 w-full rounded-2xl border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 focus:border-amber-300 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            class="min-w-0 w-full rounded-2xl border border-sky-300/15 bg-slate-900/80 px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 outline-none transition focus:border-sky-300/50 focus:ring-2 focus:ring-sky-300/20 disabled:cursor-not-allowed disabled:opacity-50"
             disabled={currentAction !== "idle"}
           />
           <button
             type="submit"
-            class="w-full shrink-0 rounded-2xl border border-amber-300/80 bg-transparent px-4 py-2.5 text-sm font-semibold text-amber-200 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:border-slate-700 disabled:text-slate-600 sm:w-auto"
+            class="w-full shrink-0 rounded-2xl border border-sky-300/20 bg-sky-400/10 px-4 py-2.5 text-sm font-semibold text-sky-100 transition duration-200 ease-out hover:bg-sky-400/15 hover:translate-y-[-1px] active:scale-[0.99] disabled:cursor-not-allowed disabled:border-slate-700 disabled:text-slate-600 sm:w-auto"
             disabled={currentAction !== "idle" || !manualInput.trim()}
           >
             Verify
@@ -127,20 +131,22 @@
       </div>
 
         {#if errorMessage}
-          <div class="rounded-3xl border border-rose-400/50 bg-rose-950/70 px-4 py-3 text-sm text-rose-100">
+          <div class="rounded-[1.6rem] border border-rose-300/30 bg-rose-950/60 px-4 py-3 text-sm text-rose-100 shadow-[0_18px_44px_rgba(127,29,29,0.2)] animate-fade-up-2">
             {errorMessage}
           </div>
         {/if}
 
       {#if currentAction === "checking"}
-        <div class="grid place-items-center rounded-3xl border border-slate-700/70 bg-slate-900/90 px-4 py-10 text-center shadow-[0_18px_45px_rgba(0,0,0,0.32)]">
-          <div class="h-10 w-10 animate-spin rounded-full border-2 border-slate-700 border-t-amber-300"></div>
-            <p class="mt-4 text-sm text-slate-300">Tracing brand ownership and origin country from search context...</p>
+        <div class="grid place-items-center rounded-[1.75rem] border border-sky-300/15 bg-slate-950/70 px-4 py-10 text-center shadow-[0_24px_60px_rgba(3,10,22,0.55)] backdrop-blur-xl animate-fade-up-2">
+          <div class="h-10 w-10 animate-spin rounded-full border-2 border-slate-700 border-t-sky-300"></div>
+            <p class="mt-4 text-sm text-slate-300">Tracing brand ownership, physical origin, and parent structure...</p>
         </div>
         {:else if evaluation}
-          <VerificationCard result={evaluation} />
+          <div class="animate-fade-up-3">
+            <VerificationCard result={evaluation} />
+          </div>
           <button
-            class="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm font-medium text-slate-100 transition active:scale-[0.99]"
+            class="w-full rounded-2xl border border-sky-300/15 bg-slate-950/70 px-4 py-3 text-sm font-medium text-slate-100 transition duration-200 ease-out hover:border-sky-300/35 hover:bg-slate-900/80 hover:translate-y-[-1px] active:scale-[0.99] animate-fade-up-3"
             onclick={reset}
           >
             Scan Another

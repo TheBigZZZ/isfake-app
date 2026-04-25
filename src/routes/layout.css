@@ -1,3 +1,100 @@
 @import 'tailwindcss';
 @plugin '@tailwindcss/forms';
 @plugin '@tailwindcss/typography';
+
+@layer base {
+	html,
+	body,
+	#svelte {
+		height: 100%;
+	}
+
+	body {
+		margin: 0;
+		background:
+			radial-gradient(circle at top left, rgba(125, 211, 252, 0.18), transparent 28%),
+			radial-gradient(circle at 85% 15%, rgba(56, 189, 248, 0.14), transparent 20%),
+			linear-gradient(180deg, #06101d 0%, #081423 45%, #050b14 100%);
+		color: rgb(226 232 240);
+		color-scheme: dark;
+	}
+}
+
+@keyframes float-slow {
+	0%,
+	100% {
+		transform: translate3d(0, 0, 0) scale(1);
+	}
+	50% {
+		transform: translate3d(0, -10px, 0) scale(1.03);
+	}
+}
+
+@keyframes fade-up {
+	from {
+		opacity: 0;
+		transform: translateY(14px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+@keyframes shimmer {
+	0% {
+		background-position: 0% 50%;
+	}
+	100% {
+		background-position: 100% 50%;
+	}
+}
+
+@layer utilities {
+	.app-shell {
+		position: relative;
+		isolation: isolate;
+	}
+
+	.app-shell::before {
+		content: '';
+		position: absolute;
+		inset: 0;
+		pointer-events: none;
+		opacity: 0.25;
+		background-image:
+			radial-gradient(rgba(125, 211, 252, 0.18) 1px, transparent 1px),
+			radial-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+		background-position: 0 0, 16px 16px;
+		background-size: 32px 32px;
+		mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.9), transparent 85%);
+	}
+
+	.animate-float-slow {
+		animation: float-slow 11s ease-in-out infinite;
+	}
+
+	.animate-fade-up {
+		animation: fade-up 0.55s ease both;
+	}
+
+	.animate-fade-up-1 {
+		animation: fade-up 0.65s ease both;
+		animation-delay: 90ms;
+	}
+
+	.animate-fade-up-2 {
+		animation: fade-up 0.7s ease both;
+		animation-delay: 160ms;
+	}
+
+	.animate-fade-up-3 {
+		animation: fade-up 0.75s ease both;
+		animation-delay: 230ms;
+	}
+
+	.animate-shimmer {
+		background-size: 200% 200%;
+		animation: shimmer 4.2s ease infinite;
+	}
+}
