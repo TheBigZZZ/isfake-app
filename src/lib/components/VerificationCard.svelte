@@ -73,7 +73,7 @@
 				{tone.label}
 			</span>
 			<span class="rounded-full border border-slate-600 px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-slate-300">
-				V15 forensic audit
+				V21 forensic audit
 			</span>
 		</div>
 

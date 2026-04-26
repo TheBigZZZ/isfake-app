@@ -4,7 +4,7 @@ import type { VerificationResult } from '$lib/verification';
 // TODO: Replace with your projected Supabase URL and Anon Key
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://placeholder.supabase.co';
 const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'public-anon-key';
-const verifyApiUrl = import.meta.env.VITE_VERIFY_API_URL?.replace(/\/$/, '') || '/api/verify';
+const verifyApiUrl = import.meta.env.VITE_VERIFY_API_URL?.replace(/\/$/, '') || '/api/scan';
 
 export const supabase = createClient(supabaseUrl, supabaseKey);
 
