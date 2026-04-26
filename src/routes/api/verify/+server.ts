@@ -1,1 +1,1 @@
-import { GET, OPTIONS, POST } from '../scan/+server';
+export { GET, OPTIONS, POST } from '../scan/+server';
