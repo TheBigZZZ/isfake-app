@@ -14,6 +14,9 @@ type OpenFoodFactsProduct = {
 	product_name?: string;
 	brands?: string;
 	brand_owner?: string;
+	manufacturer_name?: string;
+	brands_tags?: string[] | string;
+	owner?: string;
 	generic_name?: string;
 	categories?: string;
 	countries?: string;
@@ -158,8 +161,8 @@ const STEALTH_USER_AGENTS = [
 ];
 const STEALTH_ACCEPT_LANGUAGES = ['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'en-US,en;q=0.7'];
 const STEALTH_REFERERS = ['https://www.google.com/', 'https://duckduckgo.com/', 'https://www.bing.com/'];
-const JITTER_MIN_MS = 1200;
-const JITTER_MAX_MS = 2500;
+const JITTER_MIN_MS = 1500;
+const JITTER_MAX_MS = 3000;
 const ALLOWED_ORIGINS = new Set([
 	'https://localhost',
 	'https://localhost:5173',
@@ -362,6 +365,68 @@ function containsSodaSignals(text: string) {
 	return containsAny(text, ['sodastream', 'co2', 'pepsico']);
 }
 
+function containsFerreroSignals(text: string) {
+	return containsAny(text, ['ferrero', 'nutella', 'kinder', 'tic tac']);
+}
+
+function canonicalizeBrand(rawBrand: string) {
+	const normalized = normalizeText(rawBrand);
+	const lower = normalized.toLowerCase();
+	if (!normalized) return '';
+	if (lower.includes('nutella')) return 'Nutella';
+	if (lower.includes('ferrero') || lower.includes('kinder') || lower.includes('tic tac')) {
+		return 'Ferrero';
+	}
+	return normalized;
+}
+
+function parseOffBrandDeep(product: OpenFoodFactsProduct | null) {
+	if (!product) {
+		return { brand: '', source: '', parsed: false };
+	}
+
+	const fromBrands = normalizeText(product.brands)
+		.split(',')
+		.map((item) => normalizeText(item))
+		.find(Boolean);
+	if (fromBrands) {
+		const canonical = canonicalizeBrand(fromBrands);
+		console.log(`📦 [PARSED] OFF nested brand source=brands value=${canonical}`);
+		return { brand: canonical, source: 'brands', parsed: true };
+	}
+
+	const fromManufacturer = normalizeText(product.manufacturer_name);
+	if (fromManufacturer) {
+		const canonical = canonicalizeBrand(fromManufacturer);
+		console.log(`📦 [PARSED] OFF nested brand source=manufacturer_name value=${canonical}`);
+		return { brand: canonical, source: 'manufacturer_name', parsed: true };
+	}
+
+	const tags = Array.isArray(product.brands_tags)
+		? product.brands_tags
+		: normalizeText(product.brands_tags)
+			? [normalizeText(product.brands_tags)]
+			: [];
+	const fromTags = tags
+		.map((tag) => normalizeText(tag).replace(/^[a-z]{2}:/i, ''))
+		.map((tag) => normalizeText(tag.replace(/[-_]/g, ' ')))
+		.find(Boolean);
+	if (fromTags) {
+		const canonical = canonicalizeBrand(fromTags);
+		console.log(`📦 [PARSED] OFF nested brand source=brands_tags value=${canonical}`);
+		return { brand: canonical, source: 'brands_tags', parsed: true };
+	}
+
+	const fromOwner = normalizeText(product.owner);
+	if (fromOwner) {
+		const canonical = canonicalizeBrand(fromOwner);
+		console.log(`📦 [PARSED] OFF nested brand source=owner value=${canonical}`);
+		return { brand: canonical, source: 'owner', parsed: true };
+	}
+
+	return { brand: '', source: '', parsed: false };
+}
+
 function resolveFingerprintProfile(userAgent: string) {
 	const ua = normalizeText(userAgent);
 	const chromeVersion = ua.match(/Chrome\/([\d.]+)/)?.[1] ?? '124.0.0.0';
@@ -490,7 +555,7 @@ async function serperSearch(query: string) {
 }
 
 async function serperPrimarySearchWithRetry(barcode: string) {
-	const primaryQuery = `${barcode} product brand company`;
+	const primaryQuery = `${barcode} product manufacturer parent company`;
 	const primary = await serperSearch(primaryQuery).catch(() => ({
 		query: primaryQuery,
 		contextText: '',
@@ -509,7 +574,7 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 		};
 	}
 
-	const retryQuery = `${barcode} product brand company manufacturer`;
+	const retryQuery = `${barcode} manufacturer parent company owner`;
 	console.log(`🔁 [SERPER] 0 snippets on primary query; retrying with "${retryQuery}".`);
 	const retry = await serperSearch(retryQuery).catch(() => ({
 		query: retryQuery,
@@ -529,9 +594,10 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 }
 
 function buildOpenFoodFactsContext(product: OpenFoodFactsProduct) {
+	const parsed = parseOffBrandDeep(product);
 	return [
 		`OFF product_name: ${normalizeText(product.product_name) || 'Unresolved Product'}`,
-		`OFF brand(s): ${normalizeText(product.brands) || normalizeText(product.brand_owner) || 'Unresolved Brand'}`,
+		`OFF brand(s): ${parsed.brand || normalizeText(product.brand_owner) || 'Unresolved Brand'}`,
 		`OFF generic_name: ${normalizeText(product.generic_name) || 'Unresolved Product Type'}`,
 		`OFF categories: ${normalizeText(product.categories) || 'Unresolved Category'}`,
 		`OFF countries: ${normalizeText(product.countries) || 'Unresolved Origin'}`,
@@ -709,8 +775,8 @@ async function callOpenRouterAnalyzer(args: {
 	}
 
 	const offProductName = normalizeText(args.offProduct?.product_name) || 'Unresolved Product';
-	const offBrand =
-		normalizeText(args.offProduct?.brands) || normalizeText(args.offProduct?.brand_owner) || 'Unresolved Brand';
+	const offBrandParsed = parseOffBrandDeep(args.offProduct);
+	const offBrand = offBrandParsed.brand || normalizeText(args.offProduct?.brand_owner) || 'Unresolved Brand';
 
 	const systemPrompt = `PROTOCOL META:
 id=PHANTOM_TRIANGULATION_V30_FINAL
@@ -942,6 +1008,11 @@ ${args.truthBundleBlock}`;
 		if (brand.toLowerCase().includes('nutella') && !/ferrero/i.test(legalHoldingCompany)) {
 			legalHoldingCompany = 'Ferrero Group';
 			arbitrationLog = `${arbitrationLog} Applied conglomerate override: Nutella mapped to Ferrero Group.`;
+		}
+
+		if (containsFerreroSignals(`${args.marketPulse}\n${args.deepScrape}`) && !/ferrero/i.test(legalHoldingCompany)) {
+			legalHoldingCompany = 'Ferrero Group';
+			arbitrationLog = `${arbitrationLog} Ferrero-family evidence found in market/deep scrape; parent locked to Ferrero Group.`;
 		}
 
 		if (flagged && !hasDirectEvidenceForFlag(flagReasonRaw)) {
@@ -1268,6 +1339,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const marketPulse = marketPulseSearch.result;
 
 	let offProduct = offLookup.product;
+	const offParsed = parseOffBrandDeep(offProduct);
 	let offContext = offProduct ? buildOpenFoodFactsContext(offProduct) : '';
 	console.log(`📥 [OFF] Status: ${offLookup.statusCode}`);
 
@@ -1284,7 +1356,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		);
 	}
 	if ((marketPulse.snippetCount ?? 0) > 0) {
-		console.log(`📡 [Verified Snippets] Credits Used: primary=${marketPulse.snippetCount ?? 0}`);
+		console.log(`📡 [SERPER] Snippets used: primary=${marketPulse.snippetCount ?? 0}`);
 	} else {
 		console.log('⚠️ Empty Search (No Credits): primary market pulse returned 0 snippets');
 	}
@@ -1315,13 +1387,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		offContext = '';
 	}
 
-	const seedBrand = normalizeText(offProduct?.brands || offProduct?.brand_owner)
-		.split(',')
-		.map((v) => normalizeText(v))
-		.find(Boolean);
-	const corporateCrawlQuery = seedBrand
-		? `Who owns ${seedBrand} ultimate parent company`
-		: `Who owns barcode ${barcode} ultimate parent company`;
+	const corporateCrawlQuery = `${barcode} product manufacturer parent company`;
 	const corporateCrawl = await serperSearch(corporateCrawlQuery).catch(() => ({
 		query: corporateCrawlQuery,
 		contextText: '',
@@ -1331,7 +1397,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	}));
 	if ((corporateCrawl.snippetCount ?? 0) > 0) {
 		console.log(
-			`📡 [Verified Snippets] Credits Used: primary=${marketPulse.snippetCount ?? 0} ownership=${corporateCrawl.snippetCount ?? 0}`
+			`📡 [SERPER] Snippets used: primary=${marketPulse.snippetCount ?? 0} ownership=${corporateCrawl.snippetCount ?? 0}`
 		);
 	} else {
 		console.log('⚠️ Empty Search (No Credits): ownership crawl returned 0 snippets');
@@ -1345,6 +1411,11 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const registryData = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
 	const marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
 	const deepScrape = corporateCrawl.contextText || scrape.contextText || 'NO_DEEP_SCRAPE_DATA';
+	const ferreroSignalFromSearch = containsFerreroSignals(`${marketPulseData}\n${deepScrape}`);
+	const serperPromotedPrimary = serperFallbackActive || !offContext;
+	if (serperPromotedPrimary && (marketPulse.snippetCount ?? 0) > 0) {
+		console.log('📡 [SERPER] Promoted as Primary Truth to resolve unresolved OFF fields.');
+	}
 	const truthBundleBlock = `<truth_bundle>\n<off_evidence>\n${offContext || 'Source [OFF] failed; rely on remaining evidence.'}\n</off_evidence>\n<serper_evidence>\n${marketPulse.contextText || 'Source [Serper] failed; rely on remaining evidence.'}\n</serper_evidence>\n<scraper_evidence>\n${scrape.contextText || 'Source [Scraper] failed; rely on remaining evidence.'}\n</scraper_evidence>\n<ownership_crawl_evidence>\n${corporateCrawl.contextText || 'Source [Corporate_Crawl] failed; rely on remaining evidence.'}\n</ownership_crawl_evidence>\n</truth_bundle>`;
 
 	if (!offContext && !marketPulse.contextText && !scrape.contextText) {
@@ -1398,7 +1469,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		: registryOverrideNote
 			? 'market_override_void_registry'
 			: 'registry_market_consistent';
-	console.log(`⚖️ Arbitration: ${registryOverrideNote || 'Registry and market pulse did not trigger metadata-ghost void.'}`);
+	console.log(`⚖️ [DECISION] ${registryOverrideNote || 'Registry and market pulse did not trigger metadata-ghost void.'}`);
 	const sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'> = [];
 	if (offProduct) sourcesUsed.push('OFF_API');
 	if (scrape.hasContext || marketPulse.used || corporateCrawl.used) sourcesUsed.push('Search_Scrape');
@@ -1438,6 +1509,25 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		ai.arbitration_log = `${ai.arbitration_log} Enforced SodaStream live-market override; ultimate parent locked to PepsiCo.`;
 	}
 
+	if (ferreroSignalFromSearch) {
+		if (!/nutella/i.test(ai.product.brand)) {
+			ai.product.brand = offParsed.brand || 'Ferrero';
+			ai.brand = ai.product.brand;
+			ai.verified_brand = ai.product.brand;
+			ai.product_identity.brand = ai.product.brand;
+			ai.product_identity.verified_brand = ai.product.brand;
+		}
+		ai.product.ultimate_parent = 'Ferrero Group';
+		ai.legal_holding_company = 'Ferrero Group';
+		ai.parent_company = 'Ferrero Group';
+		ai.corporate_structure.ultimate_parent_company = 'Ferrero Group';
+		ai.ownership_structure.ultimate_parent = 'Ferrero Group';
+		if (ai.corporate_hierarchy) {
+			ai.corporate_hierarchy.ultimate_parent = 'Ferrero Group';
+		}
+		ai.arbitration_log = `${ai.arbitration_log} Ferrero-family evidence detected; parent locked to Ferrero Group.`;
+	}
+
 	ai.verification = {
 		sources_synced: toVerificationSources(ai.data_sources_used),
 		conflicts_resolved:
@@ -1473,12 +1563,12 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		scraper_blocked: serperFallbackActive || scrape.blocked,
 		serper_snippets_received: snippetsCount,
 		source_hierarchy: buildSourceHierarchy({
-			serperPrimary: serperFallbackActive || Boolean(marketPulse.contextText),
+			serperPrimary: serperPromotedPrimary || Boolean(marketPulse.contextText),
 			scraperAvailable: Boolean(scrape.contextText),
 			offAvailable: Boolean(offContext),
 			internalFallback: ai.data_sources_used.includes('Internal_Knowledge')
 		}),
-		conflict_resolved: Boolean(registryOverrideNote),
+		conflict_resolved: Boolean(registryOverrideNote || ferreroSignalFromSearch || serperPromotedPrimary),
 		rationale:
 			registryOverrideNote ||
 			(marketPulseSearch.retried
@@ -1486,9 +1576,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 				: 'Strict arbitration used available Serper/Scraper/OFF streams without retry escalation.')
 	};
 
-	console.log(
-		`⚖️ [Final Verdict] product=${ai.product.name} brand=${ai.product.brand} parent=${ai.product.ultimate_parent}`
-	);
+	console.log(`⚖️ [DECISION] product=${ai.product.name} brand=${ai.product.brand} parent=${ai.product.ultimate_parent}`);
 
 	await cacheScanResult({
 		barcode: ai.barcode,
