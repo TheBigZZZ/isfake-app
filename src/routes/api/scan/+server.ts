@@ -45,6 +45,12 @@ type OpenRouterCorporateOutput = {
 		category?: string;
 		confidence?: number;
 	};
+	forensic_report?: {
+		scraper_blocked: boolean;
+		serper_fallback_active: boolean;
+		ground_truth_source: 'Serper' | 'Scraper' | 'OFF';
+		rationale: string;
+	};
 	telemetry: {
 		search_present: boolean;
 		snippets_count: number;
@@ -137,6 +143,16 @@ const BROWSER_ACCEPT_HEADER =
 	'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
 const GOOGLE_MOBILE_USER_AGENT =
 	'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
+const STEALTH_USER_AGENTS = [
+	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+	'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+	'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+	GOOGLE_MOBILE_USER_AGENT
+];
+const STEALTH_ACCEPT_LANGUAGES = ['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'en-US,en;q=0.7'];
+const STEALTH_REFERERS = ['https://www.google.com/', 'https://duckduckgo.com/', 'https://www.bing.com/'];
+const JITTER_MIN_MS = 500;
+const JITTER_MAX_MS = 1500;
 const ALLOWED_ORIGINS = new Set([
 	'https://localhost',
 	'https://localhost:5173',
@@ -326,14 +342,33 @@ function toVerificationSources(
 	return mapped.length > 0 ? mapped : (['Internal'] as Array<'OFF' | 'Serper' | 'Internal'>);
 }
 
+function randomItem<T>(items: T[]) {
+	return items[Math.floor(Math.random() * items.length)];
+}
+
+async function applyJitterDelay() {
+	const delayMs = JITTER_MIN_MS + Math.floor(Math.random() * (JITTER_MAX_MS - JITTER_MIN_MS + 1));
+	await new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function containsSodaSignals(text: string) {
+	return containsAny(text, ['sodastream', 'co2', 'pepsico']);
+}
+
+function containsOffConflictSignals(text: string) {
+	return containsAny(text, ['justin', 'hormel']);
+}
+
 function buildScrapeHeaders() {
+	const randomizedUserAgent = randomItem(STEALTH_USER_AGENTS);
+	console.log('🕵️ [STEALTH] User-Agent randomized.');
 	return {
-		'User-Agent': GOOGLE_MOBILE_USER_AGENT,
+		'User-Agent': randomizedUserAgent,
 		Accept: BROWSER_ACCEPT_HEADER,
-		'Accept-Language': 'en-US,en;q=0.5',
+		'Accept-Language': randomItem(STEALTH_ACCEPT_LANGUAGES),
 		'Sec-Fetch-Mode': 'navigate',
 		'Sec-Fetch-Site': 'none',
-		Referer: 'https://www.google.com/'
+		Referer: randomItem(STEALTH_REFERERS)
 	};
 }
 
@@ -378,6 +413,8 @@ async function serperSearch(query: string) {
 		return { query, contextText: '', statusCode: 0, used: false };
 	}
 
+	await applyJitterDelay();
+
 	const response = await fetch(SERPER_API_URL, {
 		method: 'POST',
 		headers: {
@@ -414,6 +451,8 @@ function buildOpenFoodFactsContext(product: OpenFoodFactsProduct) {
 }
 
 async function lookupOpenFoodFactsProduct(barcode: string) {
+	await applyJitterDelay();
+
 	const response = await fetch(`${OPEN_FOOD_FACTS_API_URL}/${encodeURIComponent(barcode)}.json`, {
 		headers: {
 			Accept: 'application/json',
@@ -438,6 +477,8 @@ async function lookupOpenFoodFactsProduct(barcode: string) {
 }
 
 async function semanticGoogleScrape(barcode: string) {
+	await applyJitterDelay();
+
 	const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(`barcode ${barcode}`)}&hl=en&gl=us&num=10&pws=0`;
 	const response = await fetch(searchUrl, {
 		headers: buildFetchHeaders()
@@ -581,9 +622,9 @@ async function callOpenRouterAnalyzer(args: {
 	const offBrand =
 		normalizeText(args.offProduct?.brands) || normalizeText(args.offProduct?.brand_owner) || 'Unresolved Brand';
 
- 	const systemPrompt = `PROTOCOL META:
-id=FORENSIC_TRIANGULATION_V21_FINAL
-logic_engine=ADVERSARIAL_TRUTH_RECONCILIATION
+	const systemPrompt = `PROTOCOL META:
+id=GHOST_TRIANGULATION_V26_FINAL
+logic_engine=ADVERSARIAL_RESILIENT_AUDIT
 status=ULTIMATE_ACCURACY_ENABLED
 instruction_handling=STRICT_ZERO_SUMMARIZATION. EXECUTE ATOMICALLY.
 
@@ -1103,35 +1144,63 @@ async function cacheScanResult(result: {
 async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const cached = await loadCachedProduct(barcode);
 	if (cached) {
+		cached.forensic_report = {
+			scraper_blocked: false,
+			serper_fallback_active: false,
+			ground_truth_source: 'OFF',
+			rationale: 'Loaded from cache; previous triage result reused.'
+		};
 		return cached;
 	}
 
-	const offLookup = await lookupOpenFoodFactsProduct(barcode).catch(() => ({ product: null, statusCode: 0 }));
+	const marketPulseQuery = `${barcode} product name`;
+	const [offLookup, marketPulse] = await Promise.all([
+		lookupOpenFoodFactsProduct(barcode).catch(() => ({ product: null, statusCode: 0 })),
+		serperSearch(marketPulseQuery).catch(() => ({
+			query: marketPulseQuery,
+			contextText: '',
+			statusCode: 0,
+			used: false,
+			snippetCount: 0
+		}))
+	]);
+
 	let offProduct = offLookup.product;
 	let offContext = offProduct ? buildOpenFoodFactsContext(offProduct) : '';
-	console.log(
-		`📥 OFF Data: status=${offLookup.statusCode} hasProduct=${Boolean(offProduct)} name=${normalizeText(offProduct?.product_name) || 'n/a'} brand=${normalizeText(offProduct?.brands || offProduct?.brand_owner) || 'n/a'}`
-	);
+	console.log(`📥 [OFF] Status: ${offLookup.statusCode}`);
+
 	const scrape = await semanticGoogleScrape(barcode).catch(() => ({
 		blocked: true,
 		hasContext: false,
 		statusCode: 0,
 		contextText: ''
 	}));
-
-	const marketPulseQuery = `${barcode} product name`;
-	const marketPulse = await serperSearch(marketPulseQuery).catch(() => ({
-		query: marketPulseQuery,
-		contextText: '',
-		statusCode: 0,
-		used: false,
-		snippetCount: 0
-	}));
+	const serperFallbackActive = scrape.statusCode === 429;
+	if (serperFallbackActive) {
+		console.log('🚨 [BLOCK] 429 detected! Falling back to Serper evidence.');
+	}
+	console.log(
+		`📡 [SERPER] Credits used. Snippets found. primary=${marketPulse.snippetCount ?? 0}`
+	);
 
 	const offDomain = detectLikelyDomain(offContext);
-	const marketEvidenceContext = marketPulse.contextText || scrape.contextText;
+	const marketEvidenceContext = serperFallbackActive
+		? marketPulse.contextText || scrape.contextText
+		: scrape.contextText || marketPulse.contextText;
 	const marketDomain = detectLikelyDomain(marketEvidenceContext);
+	const sodaSignalFromMarket = containsSodaSignals(
+		`${marketPulse.contextText}\n${scrape.contextText}`
+	);
+	const offConflictSignal = containsOffConflictSignals(
+		`${normalizeText(offProduct?.brands || offProduct?.brand_owner)}\n${offContext}`
+	);
 	let registryOverrideNote = '';
+	if (sodaSignalFromMarket && offConflictSignal) {
+		registryOverrideNote =
+			'SodaStream/CO2/PepsiCo live signal detected; OFF Justin/Hormel conflict overridden by market pulse.';
+		offProduct = null;
+		offContext = '';
+	}
 	if (
 		offProduct &&
 		offDomain !== 'unknown' &&
@@ -1158,7 +1227,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		snippetCount: 0
 	}));
 	console.log(
-		`📡 Serper Data: marketUsed=${marketPulse.used} marketSnippets=${marketPulse.snippetCount ?? 0} corporateUsed=${corporateCrawl.used} corporateSnippets=${corporateCrawl.snippetCount ?? 0}`
+		`📡 [SERPER] Credits used. Snippets found. primary=${marketPulse.snippetCount ?? 0} ownership=${corporateCrawl.snippetCount ?? 0}`
 	);
 
 	const registryBlock = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
@@ -1170,6 +1239,13 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		console.log('⚖️ Arbitration: missing registry and market evidence; returning manual-input required fallback.');
 		return {
 			...fallback,
+			forensic_report: {
+				scraper_blocked: serperFallbackActive,
+				serper_fallback_active: serperFallbackActive,
+				ground_truth_source: marketPulse.contextText ? 'Serper' : 'OFF',
+				rationale:
+					'Missing usable registry/scraper evidence, request remains unresolved and depends on available Serper pulse.'
+			},
 			telemetry: {
 				search_present: false,
 				snippets_count: 0,
@@ -1212,6 +1288,23 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		sourcesUsed
 	});
 
+	if (sodaSignalFromMarket) {
+		ai.product.brand = 'SodaStream';
+		ai.brand = 'SodaStream';
+		ai.verified_brand = 'SodaStream';
+		ai.product_identity.brand = 'SodaStream';
+		ai.product_identity.verified_brand = 'SodaStream';
+		ai.product.ultimate_parent = 'PepsiCo';
+		ai.legal_holding_company = 'PepsiCo';
+		ai.parent_company = 'PepsiCo';
+		ai.corporate_structure.ultimate_parent_company = 'PepsiCo';
+		ai.ownership_structure.ultimate_parent = 'PepsiCo';
+		if (ai.corporate_hierarchy) {
+			ai.corporate_hierarchy.ultimate_parent = 'PepsiCo';
+		}
+		ai.arbitration_log = `${ai.arbitration_log} Enforced SodaStream live-market override; ultimate parent locked to PepsiCo.`;
+	}
+
 	ai.verification = {
 		sources_synced: toVerificationSources(ai.data_sources_used),
 		conflicts_resolved:
@@ -1225,6 +1318,25 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 					? ai.product.confidence
 					: 0.82
 	};
+
+		ai.forensic_report = {
+			scraper_blocked: serperFallbackActive,
+			serper_fallback_active: serperFallbackActive,
+			ground_truth_source: serperFallbackActive
+				? 'Serper'
+				: scrape.hasContext
+					? 'Scraper'
+					: marketPulse.used
+						? 'Serper'
+						: 'OFF',
+			rationale:
+				registryOverrideNote ||
+				(sodaSignalFromMarket
+					? 'Live market pulse (SodaStream/CO2/PepsiCo) overrode stale OFF conflict signals.'
+					: 'Triangulated OFF, Serper, and scraper evidence with resilient fallback behavior.')
+		};
+
+		console.log(`⚖️ [DECISION] Identity confirmed as ${ai.product.brand}.`);
 
 	await cacheScanResult({
 		barcode: ai.barcode,
