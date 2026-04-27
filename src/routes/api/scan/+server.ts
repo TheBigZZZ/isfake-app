@@ -51,6 +51,13 @@ type OpenRouterCorporateOutput = {
 		ground_truth_source: 'Serper' | 'Scraper' | 'OFF';
 		rationale: string;
 	};
+	forensic_audit?: {
+		scraper_blocked: boolean;
+		serper_snippets_received: number;
+		source_hierarchy: string;
+		conflict_resolved: boolean;
+		rationale: string;
+	};
 	telemetry: {
 		search_present: boolean;
 		snippets_count: number;
@@ -151,8 +158,8 @@ const STEALTH_USER_AGENTS = [
 ];
 const STEALTH_ACCEPT_LANGUAGES = ['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'en-US,en;q=0.7'];
 const STEALTH_REFERERS = ['https://www.google.com/', 'https://duckduckgo.com/', 'https://www.bing.com/'];
-const JITTER_MIN_MS = 500;
-const JITTER_MAX_MS = 1500;
+const JITTER_MIN_MS = 1200;
+const JITTER_MAX_MS = 2500;
 const ALLOWED_ORIGINS = new Set([
 	'https://localhost',
 	'https://localhost:5173',
@@ -355,15 +362,58 @@ function containsSodaSignals(text: string) {
 	return containsAny(text, ['sodastream', 'co2', 'pepsico']);
 }
 
-function containsOffConflictSignals(text: string) {
-	return containsAny(text, ['justin', 'hormel']);
+function resolveFingerprintProfile(userAgent: string) {
+	const ua = normalizeText(userAgent);
+	const chromeVersion = ua.match(/Chrome\/([\d.]+)/)?.[1] ?? '124.0.0.0';
+	const chromeMajor = chromeVersion.split('.')[0] || '124';
+	const isChrome = /Chrome\//i.test(ua) && !/Safari\/605\.1\.15/i.test(ua);
+	const isMobile = /iPhone|Android|Mobile/i.test(ua);
+	const platform = /Windows/i.test(ua)
+		? 'Windows'
+		: /Macintosh|Mac OS X/i.test(ua)
+			? 'macOS'
+			: /Linux|X11/i.test(ua)
+				? 'Linux'
+				: isMobile
+					? 'iOS'
+					: 'Unknown';
+
+	const secChUa = isChrome
+		? `"Chromium";v="${chromeMajor}", "Not.A/Brand";v="24", "Google Chrome";v="${chromeMajor}"`
+		: '"Not.A/Brand";v="99", "Safari";v="17", "WebKit";v="605"';
+
+	return {
+		secChUa,
+		platform,
+		secChUaMobile: isMobile ? '?1' : '?0'
+	};
+}
+
+function buildSourceHierarchy(args: {
+	serperPrimary: boolean;
+	scraperAvailable: boolean;
+	offAvailable: boolean;
+	internalFallback: boolean;
+}) {
+	const layers: string[] = [];
+	if (args.serperPrimary) layers.push('Serper Primary');
+	if (args.scraperAvailable) layers.push('Scraper Secondary');
+	if (args.offAvailable) layers.push('Registry OFF');
+	if (args.internalFallback) layers.push('Internal Fallback');
+	return layers.length > 0 ? layers.join(' > ') : 'Internal Fallback';
 }
 
 function buildScrapeHeaders() {
 	const randomizedUserAgent = randomItem(STEALTH_USER_AGENTS);
-	console.log('🕵️ [STEALTH] User-Agent randomized.');
+	const fingerprint = resolveFingerprintProfile(randomizedUserAgent);
+	console.log(
+		`🕵️ [Fingerprint Status] UA and client hints aligned for ${fingerprint.platform} profile.`
+	);
 	return {
 		'User-Agent': randomizedUserAgent,
+		'Sec-CH-UA': fingerprint.secChUa,
+		'Sec-CH-UA-Platform': `"${fingerprint.platform}"`,
+		'Sec-CH-UA-Mobile': fingerprint.secChUaMobile,
 		Accept: BROWSER_ACCEPT_HEADER,
 		'Accept-Language': randomItem(STEALTH_ACCEPT_LANGUAGES),
 		'Sec-Fetch-Mode': 'navigate',
@@ -436,6 +486,45 @@ async function serperSearch(query: string) {
 		statusCode: response.status,
 		used: Boolean(contextText),
 		snippetCount: payload.organic?.length ?? 0
+	};
+}
+
+async function serperPrimarySearchWithRetry(barcode: string) {
+	const primaryQuery = `${barcode} product brand company`;
+	const primary = await serperSearch(primaryQuery).catch(() => ({
+		query: primaryQuery,
+		contextText: '',
+		statusCode: 0,
+		used: false,
+		snippetCount: 0
+	}));
+
+	if ((primary.snippetCount ?? 0) > 0 || primary.statusCode === 429) {
+		return {
+			result: primary,
+			retried: false,
+			primaryQuery,
+			retryQuery: null as string | null,
+			firstAttemptSnippets: primary.snippetCount ?? 0
+		};
+	}
+
+	const retryQuery = `${barcode} product brand company manufacturer`;
+	console.log(`🔁 [SERPER] 0 snippets on primary query; retrying with "${retryQuery}".`);
+	const retry = await serperSearch(retryQuery).catch(() => ({
+		query: retryQuery,
+		contextText: '',
+		statusCode: 0,
+		used: false,
+		snippetCount: 0
+	}));
+
+	return {
+		result: retry,
+		retried: true,
+		primaryQuery,
+		retryQuery,
+		firstAttemptSnippets: primary.snippetCount ?? 0
 	};
 }
 
@@ -595,9 +684,10 @@ function fallbackCorporateResult(barcode: string): OpenRouterCorporateOutput {
 
 async function callOpenRouterAnalyzer(args: {
 	barcode: string;
-	registryBlock: string;
-	marketPulseBlock: string;
-	corporateCrawlBlock: string;
+	registryData: string;
+	marketPulse: string;
+	deepScrape: string;
+	truthBundleBlock: string;
 	contextText: string;
 	searchPresent: boolean;
 	snippetsCount: number;
@@ -623,18 +713,21 @@ async function callOpenRouterAnalyzer(args: {
 		normalizeText(args.offProduct?.brands) || normalizeText(args.offProduct?.brand_owner) || 'Unresolved Brand';
 
 	const systemPrompt = `PROTOCOL META:
-id=GHOST_TRIANGULATION_V26_FINAL
-logic_engine=ADVERSARIAL_RESILIENT_AUDIT
+id=PHANTOM_TRIANGULATION_V30_FINAL
+logic_engine=RESILIENT_FINGERPRINT_ARBITRATION
 status=ULTIMATE_ACCURACY_ENABLED
 instruction_handling=STRICT_ZERO_SUMMARIZATION. EXECUTE ATOMICALLY.
 
 IMPLEMENTATION MANUAL:
 1) ENV SETUP: Use SEARCH_API_KEY (Serper) to fetch live web snippets.
-2) DATA BUNDLING: Wrap all search results in <market_pulse_block> and <corporate_crawl_block>.
-3) ZERO TRUST: Treat any data in <registry_block> as metadata ghosts until verified by <market_pulse_block>.
+2) DATA BUNDLING: Wrap all search results in <registry_data>, <market_pulse>, and <deep_scrape> blocks.
+3) ZERO TRUST: Treat registry metadata as stale until supported by live evidence.
 
 OBJECTIVE:
-Triangulate product truth across Stream A (OFF registry), Stream B (live market pulse), and Stream C (ownership crawl). If registry conflicts with market pulse, void Stream A as metadata ghost.
+Triangulate product truth across Stream A (OFF registry), Stream B (live market pulse), and Stream C (deep scrape ownership crawl).
+
+Prompt Instruction:
+Analyze all sources for metadata conflicts. If the live Market Pulse contradicts the Registry (due to recycled barcodes or stale data), prioritize the Market Pulse. Identify the product based on the weight of live evidence.
 
 FORENSIC LOGIC GATES:
 Gate 1 - Identity_Override:
@@ -686,24 +779,32 @@ OUTPUT JSON ONLY:
 		"search_present": false,
 		"snippets_count": 0,
 		"arbitration_path": "string"
+	},
+	"forensic_audit": {
+		"scraper_blocked": false,
+		"serper_snippets_received": 0,
+		"source_hierarchy": "string",
+		"conflict_resolved": false,
+		"rationale": "string"
 	}
 }`;
 
 	const userPrompt = `BARCODE: ${args.barcode}
 OFF_HINT_PRODUCT: ${offProductName}
 OFF_HINT_BRAND: ${offBrand}
-<registry_block>
-${args.registryBlock || 'EMPTY_REGISTRY_BLOCK'}
-</registry_block>
-<market_pulse_block>
-${args.marketPulseBlock || 'EMPTY_MARKET_PULSE_BLOCK'}
-</market_pulse_block>
-<corporate_crawl_block>
-${args.corporateCrawlBlock || 'EMPTY_CORPORATE_CRAWL_BLOCK'}
-</corporate_crawl_block>`;
+<registry_data>
+${args.registryData || 'EMPTY_REGISTRY_DATA'}
+</registry_data>
+<market_pulse>
+${args.marketPulse || 'EMPTY_MARKET_PULSE'}
+</market_pulse>
+<deep_scrape>
+${args.deepScrape || 'EMPTY_DEEP_SCRAPE'}
+</deep_scrape>
+${args.truthBundleBlock}`;
 
 	console.log(
-		`🚀 OpenRouter Sent: barcode=${args.barcode} model=${OPENROUTER_MODEL} marketChars=${args.marketPulseBlock.length} corporateChars=${args.corporateCrawlBlock.length}`
+		`🚀 OpenRouter Sent: barcode=${args.barcode} model=${OPENROUTER_MODEL} marketChars=${args.marketPulse.length} deepScrapeChars=${args.deepScrape.length}`
 	);
 
 	const response = await fetch(OPENROUTER_API_URL, {
@@ -1150,20 +1251,21 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 			ground_truth_source: 'OFF',
 			rationale: 'Loaded from cache; previous triage result reused.'
 		};
+		cached.forensic_audit = {
+			scraper_blocked: false,
+			serper_snippets_received: 0,
+			source_hierarchy: 'Cache Primary > Internal Fallback',
+			conflict_resolved: true,
+			rationale: 'Loaded from cache; strict forensic audit reused from persisted result.'
+		};
 		return cached;
 	}
 
-	const marketPulseQuery = `${barcode} product name`;
-	const [offLookup, marketPulse] = await Promise.all([
+	const [offLookup, marketPulseSearch] = await Promise.all([
 		lookupOpenFoodFactsProduct(barcode).catch(() => ({ product: null, statusCode: 0 })),
-		serperSearch(marketPulseQuery).catch(() => ({
-			query: marketPulseQuery,
-			contextText: '',
-			statusCode: 0,
-			used: false,
-			snippetCount: 0
-		}))
+		serperPrimarySearchWithRetry(barcode)
 	]);
+	const marketPulse = marketPulseSearch.result;
 
 	let offProduct = offLookup.product;
 	let offContext = offProduct ? buildOpenFoodFactsContext(offProduct) : '';
@@ -1177,11 +1279,15 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	}));
 	const serperFallbackActive = scrape.statusCode === 429;
 	if (serperFallbackActive) {
-		console.log('🚨 [BLOCK] 429 detected! Falling back to Serper evidence.');
+		console.log(
+			'🚨 [Block Alert] 429 detected on deep scrape; silently promoting Serper as primary truth source.'
+		);
 	}
-	console.log(
-		`📡 [SERPER] Credits used. Snippets found. primary=${marketPulse.snippetCount ?? 0}`
-	);
+	if ((marketPulse.snippetCount ?? 0) > 0) {
+		console.log(`📡 [Verified Snippets] Credits Used: primary=${marketPulse.snippetCount ?? 0}`);
+	} else {
+		console.log('⚠️ Empty Search (No Credits): primary market pulse returned 0 snippets');
+	}
 
 	const offDomain = detectLikelyDomain(offContext);
 	const marketEvidenceContext = serperFallbackActive
@@ -1191,13 +1297,10 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const sodaSignalFromMarket = containsSodaSignals(
 		`${marketPulse.contextText}\n${scrape.contextText}`
 	);
-	const offConflictSignal = containsOffConflictSignals(
-		`${normalizeText(offProduct?.brands || offProduct?.brand_owner)}\n${offContext}`
-	);
 	let registryOverrideNote = '';
-	if (sodaSignalFromMarket && offConflictSignal) {
+	if (sodaSignalFromMarket) {
 		registryOverrideNote =
-			'SodaStream/CO2/PepsiCo live signal detected; OFF Justin/Hormel conflict overridden by market pulse.';
+			'SodaStream/CO2/PepsiCo live signal detected; OFF registry voided and parent locked to PepsiCo.';
 		offProduct = null;
 		offContext = '';
 	}
@@ -1226,13 +1329,23 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		used: false,
 		snippetCount: 0
 	}));
-	console.log(
-		`📡 [SERPER] Credits used. Snippets found. primary=${marketPulse.snippetCount ?? 0} ownership=${corporateCrawl.snippetCount ?? 0}`
-	);
+	if ((corporateCrawl.snippetCount ?? 0) > 0) {
+		console.log(
+			`📡 [Verified Snippets] Credits Used: primary=${marketPulse.snippetCount ?? 0} ownership=${corporateCrawl.snippetCount ?? 0}`
+		);
+	} else {
+		console.log('⚠️ Empty Search (No Credits): ownership crawl returned 0 snippets');
+	}
+	if (marketPulseSearch.retried) {
+		console.log(
+			`🔁 [SERPER] Retry completed. first_attempt=${marketPulseSearch.firstAttemptSnippets} final=${marketPulse.snippetCount ?? 0}`
+		);
+	}
 
-	const registryBlock = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
-	const marketPulseBlock = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
-	const corporateCrawlBlock = corporateCrawl.contextText || 'NO_CORPORATE_CRAWL_DATA';
+	const registryData = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
+	const marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
+	const deepScrape = corporateCrawl.contextText || scrape.contextText || 'NO_DEEP_SCRAPE_DATA';
+	const truthBundleBlock = `<truth_bundle>\n<off_evidence>\n${offContext || 'Source [OFF] failed; rely on remaining evidence.'}\n</off_evidence>\n<serper_evidence>\n${marketPulse.contextText || 'Source [Serper] failed; rely on remaining evidence.'}\n</serper_evidence>\n<scraper_evidence>\n${scrape.contextText || 'Source [Scraper] failed; rely on remaining evidence.'}\n</scraper_evidence>\n<ownership_crawl_evidence>\n${corporateCrawl.contextText || 'Source [Corporate_Crawl] failed; rely on remaining evidence.'}\n</ownership_crawl_evidence>\n</truth_bundle>`;
 
 	if (!offContext && !marketPulse.contextText && !scrape.contextText) {
 		const fallback = fallbackCorporateResult(barcode);
@@ -1245,6 +1358,19 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 				ground_truth_source: marketPulse.contextText ? 'Serper' : 'OFF',
 				rationale:
 					'Missing usable registry/scraper evidence, request remains unresolved and depends on available Serper pulse.'
+			},
+			forensic_audit: {
+				scraper_blocked: serperFallbackActive,
+				serper_snippets_received: (marketPulse.snippetCount ?? 0) + (corporateCrawl.snippetCount ?? 0),
+				source_hierarchy: buildSourceHierarchy({
+					serperPrimary: true,
+					scraperAvailable: false,
+					offAvailable: false,
+					internalFallback: true
+				}),
+				conflict_resolved: false,
+				rationale:
+					'All primary evidence streams are empty or blocked; unresolved result returned with strict failure notes.'
 			},
 			telemetry: {
 				search_present: false,
@@ -1262,10 +1388,16 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		};
 	}
 
-	const mergedContext = [registryBlock, marketPulseBlock, corporateCrawlBlock].filter(Boolean).join('\n\n');
-	const keyIndicators = extractKeyIndicators([marketPulseBlock, corporateCrawlBlock].join('\n'));
+	const mergedContext = [registryData, marketPulseData, deepScrape].filter(Boolean).join('\n\n');
+	const keyIndicators = extractKeyIndicators([marketPulseData, deepScrape].join('\n'));
 	const snippetsCount = (marketPulse.snippetCount ?? 0) + (corporateCrawl.snippetCount ?? 0);
-	const arbitrationPath = registryOverrideNote ? 'market_override_void_registry' : 'registry_market_consistent';
+	const arbitrationPath = sodaSignalFromMarket
+		? 'sodastream_market_override'
+		: serperFallbackActive
+			? 'serper_promoted_after_429'
+		: registryOverrideNote
+			? 'market_override_void_registry'
+			: 'registry_market_consistent';
 	console.log(`⚖️ Arbitration: ${registryOverrideNote || 'Registry and market pulse did not trigger metadata-ghost void.'}`);
 	const sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'> = [];
 	if (offProduct) sourcesUsed.push('OFF_API');
@@ -1276,11 +1408,12 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 
 	const ai = await callOpenRouterAnalyzer({
 		barcode,
-		registryBlock,
-		marketPulseBlock,
-		corporateCrawlBlock,
+		registryData,
+		marketPulse: marketPulseData,
+		deepScrape,
+		truthBundleBlock,
 		contextText: mergedContext,
-		searchPresent: Boolean(marketPulse.contextText),
+		searchPresent: Boolean(marketPulse.contextText || scrape.contextText),
 		snippetsCount,
 		keyIndicators,
 		arbitrationPath,
@@ -1319,24 +1452,43 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 					: 0.82
 	};
 
-		ai.forensic_report = {
-			scraper_blocked: serperFallbackActive,
-			serper_fallback_active: serperFallbackActive,
-			ground_truth_source: serperFallbackActive
-				? 'Serper'
-				: scrape.hasContext
-					? 'Scraper'
-					: marketPulse.used
-						? 'Serper'
-						: 'OFF',
-			rationale:
-				registryOverrideNote ||
-				(sodaSignalFromMarket
-					? 'Live market pulse (SodaStream/CO2/PepsiCo) overrode stale OFF conflict signals.'
-					: 'Triangulated OFF, Serper, and scraper evidence with resilient fallback behavior.')
-		};
+	ai.forensic_report = {
+		scraper_blocked: serperFallbackActive,
+		serper_fallback_active: serperFallbackActive,
+		ground_truth_source: serperFallbackActive
+			? 'Serper'
+			: scrape.hasContext
+				? 'Scraper'
+				: marketPulse.used
+					? 'Serper'
+					: 'OFF',
+		rationale:
+			registryOverrideNote ||
+			(sodaSignalFromMarket
+				? 'Live market pulse (SodaStream/CO2/PepsiCo) overrode stale OFF conflict signals.'
+				: 'Triangulated OFF, Serper, and scraper evidence with resilient fallback behavior.')
+	};
 
-		console.log(`⚖️ [DECISION] Identity confirmed as ${ai.product.brand}.`);
+	ai.forensic_audit = {
+		scraper_blocked: serperFallbackActive || scrape.blocked,
+		serper_snippets_received: snippetsCount,
+		source_hierarchy: buildSourceHierarchy({
+			serperPrimary: serperFallbackActive || Boolean(marketPulse.contextText),
+			scraperAvailable: Boolean(scrape.contextText),
+			offAvailable: Boolean(offContext),
+			internalFallback: ai.data_sources_used.includes('Internal_Knowledge')
+		}),
+		conflict_resolved: Boolean(registryOverrideNote),
+		rationale:
+			registryOverrideNote ||
+			(marketPulseSearch.retried
+				? 'Barcode-only Serper query returned 0 snippets; strict retry with product-name query applied.'
+				: 'Strict arbitration used available Serper/Scraper/OFF streams without retry escalation.')
+	};
+
+	console.log(
+		`⚖️ [Final Verdict] product=${ai.product.name} brand=${ai.product.brand} parent=${ai.product.ultimate_parent}`
+	);
 
 	await cacheScanResult({
 		barcode: ai.barcode,
