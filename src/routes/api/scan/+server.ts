@@ -16,6 +16,7 @@ type OpenFoodFactsProduct = {
 	brand_owner?: string;
 	manufacturer_name?: string;
 	brands_tags?: string[] | string;
+	owner_name?: string;
 	owner?: string;
 	generic_name?: string;
 	categories?: string;
@@ -45,8 +46,14 @@ type OpenRouterCorporateOutput = {
 		name: string;
 		brand: string;
 		ultimate_parent: string;
+		parent: string;
+		hq: string;
 		category?: string;
 		confidence?: number;
+	};
+	audit?: {
+		parent_evidence: string;
+		hq_evidence: string;
 	};
 	forensic_report?: {
 		scraper_blocked: boolean;
@@ -111,6 +118,7 @@ type OpenRouterCorporateOutput = {
 		ultimate_parent: string;
 		parent_hq_country: string;
 	};
+    
 	compliance_status: {
 		is_flagged: boolean;
 		flag_reason: string | null;
@@ -131,6 +139,12 @@ type OpenRouterCorporateOutput = {
 	origin_country: string;
 	reasoning: string;
 	error?: string;
+	geopolitical_audit?: {
+		status: string;
+		evidence: string;
+		israeli_related: boolean;
+	};
+	verification_card_label?: string;
 };
 
 type CachedProductRow = {
@@ -161,8 +175,9 @@ const STEALTH_USER_AGENTS = [
 ];
 const STEALTH_ACCEPT_LANGUAGES = ['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'en-US,en;q=0.7'];
 const STEALTH_REFERERS = ['https://www.google.com/', 'https://duckduckgo.com/', 'https://www.bing.com/'];
-const JITTER_MIN_MS = 1500;
-const JITTER_MAX_MS = 3000;
+// For V36 Omni-Sovereign, use a fixed 2s jitter to meet stealth requirements
+const JITTER_MIN_MS = 2000;
+const JITTER_MAX_MS = 2000;
 const ALLOWED_ORIGINS = new Set([
 	'https://localhost',
 	'https://localhost:5173',
@@ -366,7 +381,13 @@ function containsSodaSignals(text: string) {
 }
 
 function containsFerreroSignals(text: string) {
-	return containsAny(text, ['ferrero', 'nutella', 'kinder', 'tic tac']);
+	return containsAny(text, ['ferrero', 'nutella', 'kinder', 'tic tac', 'tictac', 'gianduja']);
+}
+
+function isUnresolved(value: string | undefined | null) {
+	const v = normalizeText(value).toLowerCase();
+	if (!v) return true;
+	return /unresolved|unknown|n\/?a|n.a.|none/.test(v);
 }
 
 function canonicalizeBrand(rawBrand: string) {
@@ -378,6 +399,67 @@ function canonicalizeBrand(rawBrand: string) {
 		return 'Ferrero';
 	}
 	return normalized;
+}
+
+function extractBrandLeadFromMarketContext(contextText: string) {
+	const lines = contextText
+		.split('\n')
+		.map((line) => normalizeText(line))
+		.filter(Boolean);
+	for (const line of lines) {
+		const title = line.match(/^\[\d+\]\s*([^:|]{2,80})/)?.[1];
+		const candidate = normalizeText(title || line.split('::')[0]);
+		if (!candidate) continue;
+		if (/^https?:\/\//i.test(candidate)) continue;
+		if (/barcode|product|official|company/i.test(candidate) && candidate.length < 10) continue;
+		return canonicalizeBrand(candidate);
+	}
+	return '';
+}
+
+function inferParentFromEvidence(contextText: string) {
+	const normalized = normalizeText(contextText);
+	const patterns = [
+		/(?:parent company|owned by|acquired by|manufacturer is)\s+([A-Z][A-Za-z0-9&.,'\-\s]{2,80})/i,
+		/([A-Z][A-Za-z0-9&.,'\-\s]{2,80})\s+(?:owns|acquired|is the parent company of)/i
+	];
+	for (const pattern of patterns) {
+		const match = normalized.match(pattern);
+		const value = normalizeText(match?.[1]);
+		if (value && !/unresolved|unknown|n\/a/i.test(value)) {
+			return value.replace(/[.;,:]$/, '');
+		}
+	}
+	return '';
+}
+
+function inferHqCountryFromEvidence(contextText: string) {
+	const normalized = normalizeText(contextText);
+	const patterns = [
+		/(?:global headquarters|headquarters|hq)\s+(?:is|are|in|located in)\s+([A-Z][A-Za-z\s-]{2,50})/i,
+		/([A-Z][A-Za-z\s-]{2,50})\s*(?:is home to|hosts)\s*(?:the )?(?:global )?headquarters/i
+	];
+	for (const pattern of patterns) {
+		const match = normalized.match(pattern);
+		const value = normalizeText(match?.[1]);
+		if (value && !/unresolved|unknown|n\/a/i.test(value)) {
+			return value.replace(/[.;,:]$/, '');
+		}
+	}
+	return '';
+}
+
+function pickEvidenceSnippet(contextText: string, token?: string) {
+	const lines = contextText
+		.split('\n')
+		.map((line) => normalizeText(line))
+		.filter(Boolean);
+	if (lines.length === 0) return 'No snippet evidence available.';
+	if (token) {
+		const hit = lines.find((line) => line.toLowerCase().includes(token.toLowerCase()));
+		if (hit) return hit;
+	}
+	return lines[0];
 }
 
 function parseOffBrandDeep(product: OpenFoodFactsProduct | null) {
@@ -415,6 +497,13 @@ function parseOffBrandDeep(product: OpenFoodFactsProduct | null) {
 		const canonical = canonicalizeBrand(fromTags);
 		console.log(`📦 [PARSED] OFF nested brand source=brands_tags value=${canonical}`);
 		return { brand: canonical, source: 'brands_tags', parsed: true };
+	}
+
+	const fromOwnerName = normalizeText(product.owner_name);
+	if (fromOwnerName) {
+		const canonical = canonicalizeBrand(fromOwnerName);
+		console.log(`📦 [PARSED] OFF nested brand source=owner_name value=${canonical}`);
+		return { brand: canonical, source: 'owner_name', parsed: true };
 	}
 
 	const fromOwner = normalizeText(product.owner);
@@ -555,7 +644,7 @@ async function serperSearch(query: string) {
 }
 
 async function serperPrimarySearchWithRetry(barcode: string) {
-	const primaryQuery = `${barcode} product manufacturer parent company`;
+	const primaryQuery = `${barcode} official manufacturer parent company`;
 	const primary = await serperSearch(primaryQuery).catch(() => ({
 		query: primaryQuery,
 		contextText: '',
@@ -575,7 +664,7 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 	}
 
 	const retryQuery = `${barcode} manufacturer parent company owner`;
-	console.log(`🔁 [SERPER] 0 snippets on primary query; retrying with "${retryQuery}".`);
+	console.log(`🔁 [RETRY] 0 snippets on primary query; retrying with "${retryQuery}".`);
 	const retry = await serperSearch(retryQuery).catch(() => ({
 		query: retryQuery,
 		contextText: '',
@@ -591,6 +680,35 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 		retryQuery,
 		firstAttemptSnippets: primary.snippetCount ?? 0
 	};
+}
+
+async function performSerperHardSearch(barcode: string, offProduct: OpenFoodFactsProduct | null) {
+	// Run three distinct Serper queries as a compensation strategy when OFF absent or 0 snippets
+	const queries = [] as string[];
+	queries.push(`${barcode} product details marketplace`);
+	if (offProduct) {
+		const offName = normalizeText(offProduct.product_name) || '';
+		queries.push(`${offName} manufacturer brand official`);
+		queries.push(`${offName} corporate headquarters country`);
+	} else {
+		queries.push(`${barcode} brand manufacturer`);
+		queries.push(`${barcode} company headquarters country`);
+	}
+
+	const results = await Promise.all(
+		queries.map((q) =>
+			serperSearch(q).catch(() => ({ query: q, contextText: '', statusCode: 0, used: false, snippetCount: 0 }))
+		)
+	);
+
+	// Log Serper telemetry only when organic snippets present
+	results.forEach((r, idx) => {
+		if ((r.snippetCount ?? 0) > 0) console.log(`📡 [SERPER] HardSearch query=${queries[idx]} snippets=${r.snippetCount}`);
+	});
+
+	// Merge contexts
+	const merged = results.map((r) => r.contextText).filter(Boolean).join('\n\n') || '';
+	return { queries, results, mergedContext: merged };
 }
 
 function buildOpenFoodFactsContext(product: OpenFoodFactsProduct) {
@@ -675,7 +793,13 @@ function fallbackCorporateResult(barcode: string): OpenRouterCorporateOutput {
 			verified_name: unresolvedProduct,
 			name: unresolvedProduct,
 			brand: 'Unresolved Brand',
-			ultimate_parent: 'Unresolved Parent'
+			ultimate_parent: 'Unresolved Parent',
+			parent: 'Unresolved Parent',
+			hq: 'Unresolved HQ Country'
+		},
+		audit: {
+			parent_evidence: 'No snippet evidence available.',
+			hq_evidence: 'No snippet evidence available.'
 		},
 		telemetry: {
 			search_present: false,
@@ -753,6 +877,7 @@ async function callOpenRouterAnalyzer(args: {
 	registryData: string;
 	marketPulse: string;
 	deepScrape: string;
+	hqPulse?: string;
 	truthBundleBlock: string;
 	contextText: string;
 	searchPresent: boolean;
@@ -805,7 +930,7 @@ Gate 2 - Ownership_Recursion:
 1) Identify ground-truth brand.
 2) Trace with <corporate_crawl_block>: Brand -> Manufacturer -> Ultimate Global Parent.
 3) Apply M&A overrides where needed.
-4) If Brand=SodaStream, Ultimate Parent=PepsiCo (acquired 2018).
+4) If Brand=SodaStream, note market ownership signals but do NOT hardcode parent mappings; prefer evidence-driven inference.
 5) Ignore legacy owners once current ownership is verified.
 
 Gate 3 - Confidence Triangulation:
@@ -867,6 +992,9 @@ ${args.marketPulse || 'EMPTY_MARKET_PULSE'}
 <deep_scrape>
 ${args.deepScrape || 'EMPTY_DEEP_SCRAPE'}
 </deep_scrape>
+<hq_pulse>
+${args.hqPulse || 'EMPTY_HQ_PULSE'}
+</hq_pulse>
 ${args.truthBundleBlock}`;
 
 	console.log(
@@ -947,7 +1075,7 @@ ${args.truthBundleBlock}`;
 		let legalHoldingCompany =
 			normalizeText(parsed.ownership_structure?.ultimate_parent || parsed.legal_holding_company || parsed.corporate_hierarchy?.ultimate_parent) ||
 			'Unresolved Parent';
-		const holdingCompanyHq =
+		let holdingCompanyHq =
 			normalizeText(
 				parsed.corporate_structure?.global_hq_country ||
 					parsed.ownership_structure?.parent_hq_country ||
@@ -1000,19 +1128,21 @@ ${args.truthBundleBlock}`;
 			arbitrationLog = `${arbitrationLog} Ambiguity remains due to low confidence evidence.`;
 		}
 
-		if (brand.toLowerCase().includes('sodastream') && /(hormel|justin)/i.test(legalHoldingCompany)) {
-			legalHoldingCompany = 'PepsiCo';
-			arbitrationLog = `${arbitrationLog} Applied acquisition override: SodaStream mapped to PepsiCo using 2026 ownership context.`;
-		}
+		// Evidence-driven inference: prefer explicit evidence snippets over hardcoded overrides.
+		try {
+			const inferredParent = inferParentFromEvidence(`${args.marketPulse}\n${args.deepScrape}\n${args.truthBundleBlock || ''}`);
+			if (inferredParent && isUnresolved(legalHoldingCompany)) {
+				legalHoldingCompany = inferredParent;
+				arbitrationLog = `${arbitrationLog} Inferred ultimate parent from market/deep-crawl evidence: ${inferredParent}.`;
+			}
 
-		if (brand.toLowerCase().includes('nutella') && !/ferrero/i.test(legalHoldingCompany)) {
-			legalHoldingCompany = 'Ferrero Group';
-			arbitrationLog = `${arbitrationLog} Applied conglomerate override: Nutella mapped to Ferrero Group.`;
-		}
-
-		if (containsFerreroSignals(`${args.marketPulse}\n${args.deepScrape}`) && !/ferrero/i.test(legalHoldingCompany)) {
-			legalHoldingCompany = 'Ferrero Group';
-			arbitrationLog = `${arbitrationLog} Ferrero-family evidence found in market/deep scrape; parent locked to Ferrero Group.`;
+			const inferredHq = inferHqCountryFromEvidence(`${args.marketPulse}\n${args.deepScrape}\n${args.truthBundleBlock || ''}`);
+			if (inferredHq && isUnresolved(holdingCompanyHq)) {
+				holdingCompanyHq = inferredHq;
+				arbitrationLog = `${arbitrationLog} Inferred holding company HQ country from evidence: ${inferredHq}.`;
+			}
+		} catch {
+			// non-fatal: leave arbitration as-is
 		}
 
 		if (flagged && !hasDirectEvidenceForFlag(flagReasonRaw)) {
@@ -1063,6 +1193,8 @@ ${args.truthBundleBlock}`;
 				name: verifiedName,
 				brand,
 				ultimate_parent: legalHoldingCompany,
+				parent: legalHoldingCompany,
+				hq: holdingCompanyHq,
 				category,
 				confidence
 			},
@@ -1196,6 +1328,8 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 			name: `Barcode ${cached.barcode}`,
 			brand: normalizeText(cached.brand) || 'Unresolved Brand',
 			ultimate_parent: normalizeText(cached.parent_company) || 'Unresolved Parent',
+			parent: normalizeText(cached.parent_company) || 'Unresolved Parent',
+			hq: cachedParentHq,
 			category: cachedCategory,
 			confidence: 0.95
 		},
@@ -1336,10 +1470,10 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		lookupOpenFoodFactsProduct(barcode).catch(() => ({ product: null, statusCode: 0 })),
 		serperPrimarySearchWithRetry(barcode)
 	]);
-	const marketPulse = marketPulseSearch.result;
+	let marketPulse = marketPulseSearch.result;
 
 	let offProduct = offLookup.product;
-	const offParsed = parseOffBrandDeep(offProduct);
+	parseOffBrandDeep(offProduct);
 	let offContext = offProduct ? buildOpenFoodFactsContext(offProduct) : '';
 	console.log(`📥 [OFF] Status: ${offLookup.statusCode}`);
 
@@ -1349,6 +1483,19 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		statusCode: 0,
 		contextText: ''
 	}));
+
+	// If OFF is missing/404 or Serper returned no snippets, run hard compensation searches
+	if ((!offLookup.product || offLookup.statusCode === 404) && (marketPulse.snippetCount ?? 0) === 0) {
+		console.log('⚠️ [EMPTY_REGISTRY] OFF missing or 404; triggering full compensation Serper hard-search.');
+		const hard = await performSerperHardSearch(barcode, offLookup.product).catch(() => ({ queries: [], results: [], mergedContext: '' }));
+		if (hard && hard.mergedContext) {
+			// assign merged context and sum snippet counts
+			marketPulse = Object.assign({}, marketPulse, {
+				contextText: hard.mergedContext,
+				snippetCount: hard.results.reduce((s: number, r: { snippetCount?: number }) => s + (r.snippetCount || 0), 0)
+			});
+		}
+	}
 	const serperFallbackActive = scrape.statusCode === 429;
 	if (serperFallbackActive) {
 		console.log(
@@ -1372,9 +1519,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	let registryOverrideNote = '';
 	if (sodaSignalFromMarket) {
 		registryOverrideNote =
-			'SodaStream/CO2/PepsiCo live signal detected; OFF registry voided and parent locked to PepsiCo.';
-		offProduct = null;
-		offContext = '';
+			'Market contains SodaStream/CO2 ownership signals; deferring to evidence-driven arbitration (no hardcoded parent applied).';
 	}
 	if (
 		offProduct &&
@@ -1463,7 +1608,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const keyIndicators = extractKeyIndicators([marketPulseData, deepScrape].join('\n'));
 	const snippetsCount = (marketPulse.snippetCount ?? 0) + (corporateCrawl.snippetCount ?? 0);
 	const arbitrationPath = sodaSignalFromMarket
-		? 'sodastream_market_override'
+		? 'market_soda_signals'
 		: serperFallbackActive
 			? 'serper_promoted_after_429'
 		: registryOverrideNote
@@ -1477,11 +1622,23 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		sourcesUsed.push('Internal_Knowledge');
 	}
 
+	// Attempt to extract a brand lead from market/crawl/registry for HQ pulse probing
+	const brandLead = extractBrandLeadFromMarketContext(marketPulse.contextText || corporateCrawl.contextText || offContext || '');
+	const hqQuery = brandLead ? `${brandLead} global headquarters country` : `${brandLead || ''} global headquarters country`;
+	const hqPulse = await serperSearch(hqQuery).catch(() => ({
+		query: hqQuery,
+		contextText: '',
+		statusCode: 0,
+		used: false,
+		snippetCount: 0
+	}));
+
 	const ai = await callOpenRouterAnalyzer({
 		barcode,
 		registryData,
 		marketPulse: marketPulseData,
 		deepScrape,
+		hqPulse: hqPulse.contextText || '',
 		truthBundleBlock,
 		contextText: mergedContext,
 		searchPresent: Boolean(marketPulse.contextText || scrape.contextText),
@@ -1492,40 +1649,67 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		sourcesUsed
 	});
 
-	if (sodaSignalFromMarket) {
-		ai.product.brand = 'SodaStream';
-		ai.brand = 'SodaStream';
-		ai.verified_brand = 'SodaStream';
-		ai.product_identity.brand = 'SodaStream';
-		ai.product_identity.verified_brand = 'SodaStream';
-		ai.product.ultimate_parent = 'PepsiCo';
-		ai.legal_holding_company = 'PepsiCo';
-		ai.parent_company = 'PepsiCo';
-		ai.corporate_structure.ultimate_parent_company = 'PepsiCo';
-		ai.ownership_structure.ultimate_parent = 'PepsiCo';
-		if (ai.corporate_hierarchy) {
-			ai.corporate_hierarchy.ultimate_parent = 'PepsiCo';
+	// GEOPOLITICAL AUDIT: probe for Israeli operations / funding ties for the inferred parent
+	try {
+		const ultimateParent = normalizeText(ai.product?.ultimate_parent || ai.legal_holding_company || ai.parent_company || ai.product?.parent || '');
+		if (ultimateParent && ultimateParent.toLowerCase() !== 'unresolved parent') {
+			const auditQuery = `${ultimateParent} Israeli operations funding 2026`;
+			const auditResult = await serperSearch(auditQuery).catch(() => ({ query: auditQuery, contextText: '', statusCode: 0, used: false, snippetCount: 0 }));
+			const auditContext = (auditResult.contextText || '').trim();
+			const israeliKeywords = ['israel', 'tel aviv', 'haifa', 'israeli', 'invest', 'r&d', 'research', 'manufactur', 'plant', 'subsidiary'];
+			const evidenceHit = israeliKeywords.find((k) => auditContext.toLowerCase().includes(k));
+			const geopoliticalStatus = evidenceHit ? 'Israeli-Linked' : 'International-Neutral';
+			const isIsraeli = Boolean(evidenceHit);
+
+			ai.geopolitical_audit = {
+				status: geopoliticalStatus,
+				evidence: auditContext || 'No direct snippets found for Israeli operations/funding 2026.',
+				israeli_related: isIsraeli
+			};
+
+			if (isIsraeli) console.log(`⚖️ [AUDIT] Geopolitical audit flagged Israeli-related evidence for ${ultimateParent}`);
+			else console.log(`⚖️ [AUDIT] No Israeli-related evidence found for ${ultimateParent}`);
 		}
-		ai.arbitration_log = `${ai.arbitration_log} Enforced SodaStream live-market override; ultimate parent locked to PepsiCo.`;
+	} catch {
+		// non-fatal
 	}
 
-	if (ferreroSignalFromSearch) {
-		if (!/nutella/i.test(ai.product.brand)) {
-			ai.product.brand = offParsed.brand || 'Ferrero';
-			ai.brand = ai.product.brand;
-			ai.verified_brand = ai.product.brand;
-			ai.product_identity.brand = ai.product.brand;
-			ai.product_identity.verified_brand = ai.product.brand;
+	// Add a verification card label so UI can show the new audit
+	ai.verification_card_label = 'Forensic Audit';
+	// Evidence-driven inference post-analysis: only populate parent/hq if unresolved and we have snippets
+	try {
+		const inferredParent = inferParentFromEvidence(`${marketPulseData}\n${deepScrape}\n${registryData}\n${hqPulse.contextText || ''}`);
+		const inferredHq = inferHqCountryFromEvidence(`${hqPulse.contextText || marketPulseData}\n${deepScrape}`);
+
+		if (!ai.audit) ai.audit = { parent_evidence: 'No snippet evidence available.', hq_evidence: 'No snippet evidence available.' };
+
+		if (inferredParent && isUnresolved(ai.product?.ultimate_parent)) {
+			const p = inferredParent;
+			ai.product.ultimate_parent = p;
+			ai.product.parent = p;
+			ai.legal_holding_company = p;
+			ai.parent_company = p;
+			if (ai.corporate_structure) ai.corporate_structure.ultimate_parent_company = p;
+			if (ai.ownership_structure) ai.ownership_structure.ultimate_parent = p;
+			ai.arbitration_log = `${ai.arbitration_log} Inferred parent from market/HQ evidence: ${p}.`;
+			ai.audit.parent_evidence = pickEvidenceSnippet(`${marketPulseData}\n${deepScrape}\n${registryData}`, p);
+		} else {
+			ai.audit.parent_evidence = pickEvidenceSnippet(`${marketPulseData}\n${deepScrape}\n${registryData}`, ai.product?.ultimate_parent || '');
 		}
-		ai.product.ultimate_parent = 'Ferrero Group';
-		ai.legal_holding_company = 'Ferrero Group';
-		ai.parent_company = 'Ferrero Group';
-		ai.corporate_structure.ultimate_parent_company = 'Ferrero Group';
-		ai.ownership_structure.ultimate_parent = 'Ferrero Group';
-		if (ai.corporate_hierarchy) {
-			ai.corporate_hierarchy.ultimate_parent = 'Ferrero Group';
+
+		if (inferredHq && isUnresolved(ai.corporate_structure?.global_hq_country)) {
+			const h = inferredHq;
+				if (!ai.corporate_structure) ai.corporate_structure = { ultimate_parent_company: ai.product?.ultimate_parent || '', global_hq_country: h };
+				else ai.corporate_structure.global_hq_country = h;
+				ai.holding_company_hq = h;
+				if (ai.ownership_structure) ai.ownership_structure.parent_hq_country = h;
+			ai.arbitration_log = `${ai.arbitration_log} Inferred HQ country from market/HQ evidence: ${h}.`;
+			ai.audit.hq_evidence = pickEvidenceSnippet(hqPulse.contextText || `${marketPulseData}\n${deepScrape}`, h);
+		} else {
+			ai.audit.hq_evidence = pickEvidenceSnippet(hqPulse.contextText || `${marketPulseData}\n${deepScrape}`, ai.corporate_structure?.global_hq_country || '');
 		}
-		ai.arbitration_log = `${ai.arbitration_log} Ferrero-family evidence detected; parent locked to Ferrero Group.`;
+	} catch {
+		// Non-fatal: continue with AI output
 	}
 
 	ai.verification = {
@@ -1555,7 +1739,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		rationale:
 			registryOverrideNote ||
 			(sodaSignalFromMarket
-				? 'Live market pulse (SodaStream/CO2/PepsiCo) overrode stale OFF conflict signals.'
+				? 'Live market pulse indicated SodaStream/CO2 ownership signals; resolved via evidence-driven arbitration.'
 				: 'Triangulated OFF, Serper, and scraper evidence with resilient fallback behavior.')
 	};
 
