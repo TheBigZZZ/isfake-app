@@ -933,32 +933,22 @@ async function callOpenRouterAnalyzer(args: {
 	const offBrand = offBrandParsed.brand || normalizeText(args.offProduct?.brand_owner) || 'Unresolved Brand';
 
 	const systemPrompt = `PROTOCOL META:
-id=LOGIC_BRIDGE_V38_FINAL
+id=EVIDENCE_PRIME_V40_STRICT
 logic_engine=HIGH_DENSITY_FACT_RECOVERY
 status=ULTIMATE_ACCURACY_ENABLED
 instruction_handling=STRICT_ZERO_SUMMARIZATION. EXECUTE ATOMICALLY.
 
-IMPLEMENTATION MANUAL:
-1) Use the supplied OFF registry, market pulse, and deep scrape as evidence blocks.
-2) Treat registry metadata as incomplete until supported by live evidence.
-3) Prefer the highest-density evidence path when snippets, registry, and crawl disagree.
-
 FORENSIC AUDITOR MODE:
-1) Resolve product name, brand, parent, and HQ from the supplied evidence.
-2) If search snippets mention a brand such as Nutella, use internal corporate knowledge to identify the likely ultimate parent and HQ, but do not invent unsupported facts.
-3) If evidence is insufficient, return unresolved rather than fabricating a parent or HQ.
-4) Determine whether the evidence supports an Israeli-related corporate-operation tie using the supplied evidence blocks and audit context.
-5) Keep the reasoning evidence-based and explain which source resolved each field.
-
-DEBUG TELEMETRY MANDATE:
-Every response MUST include telemetry with:
-1) search_data_received (boolean)
-2) key_indicators (array of snippets-derived tokens)
-3) decision_logic (plain explanation of arbitration)
+1) Resolve product name, brand, parent, and HQ only from the supplied evidence blocks.
+2) Prefer the densest live evidence path when OFF, Serper, scraper, or HQ pulse disagree.
+3) If snippets identify a brand, you may use established corporate knowledge to map brand to parent and HQ only when that inference is consistent with the evidence.
+4) If evidence is insufficient, return unresolved rather than inventing a parent, HQ, or geopolitical tie.
+5) Use the HQ pulse and post-analysis audit context to determine whether the parent is Israeli-linked, but keep the decision evidence-based.
+6) Explain which source resolved each field and which evidence remained ambiguous.
 
 EXECUTION MANDATE:
-1) Never return Unknown if brand identifiers exist in snippets and the evidence clearly supports a resolution.
-2) When snippets are present but parent is missing, assume parent from brand only if the evidence path supports that inference.
+1) Never use hardcoded brand-to-parent tables or fixed ownership mappings.
+2) Never return fabricated facts when registry data is incomplete.
 3) Return valid minified JSON only.
 
 OUTPUT JSON ONLY:
@@ -1574,13 +1564,14 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 
 	const registryData = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
 	const marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
-	const marketPulseForModel = normalizeText(marketPulseData).slice(0, 1500);
+	const marketPulseForModel = normalizeText(marketPulseData).slice(0, 3000);
 	const deepScrape = corporateCrawl.contextText || scrape.contextText || 'NO_DEEP_SCRAPE_DATA';
 	const ferreroSignalFromSearch = containsFerreroSignals(`${marketPulseData}\n${deepScrape}`);
 	const serperPromotedPrimary = serperFallbackActive || !offContext;
 	if (serperPromotedPrimary && (marketPulse.snippetCount ?? 0) > 0) {
 		console.log('📡 [SERPER] Promoted as Primary Truth to resolve unresolved OFF fields.');
 	}
+	console.log(`🛰️ [DATA_DENSITY] marketPulseChars=${marketPulseForModel.length} deepScrapeChars=${deepScrape.length}`);
 	const truthBundleBlock = `<truth_bundle>\n<off_evidence>\n${offContext || 'Source [OFF] failed; rely on remaining evidence.'}\n</off_evidence>\n<serper_evidence>\n${marketPulse.contextText || 'Source [Serper] failed; rely on remaining evidence.'}\n</serper_evidence>\n<scraper_evidence>\n${scrape.contextText || 'Source [Scraper] failed; rely on remaining evidence.'}\n</scraper_evidence>\n<ownership_crawl_evidence>\n${corporateCrawl.contextText || 'Source [Corporate_Crawl] failed; rely on remaining evidence.'}\n</ownership_crawl_evidence>\n</truth_bundle>`;
 
 	if (!offContext && !marketPulse.contextText && !scrape.contextText) {
@@ -1634,7 +1625,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		: registryOverrideNote
 			? 'market_override_void_registry'
 			: 'registry_market_consistent';
-	console.log(`⚖️ [DECISION] ${registryOverrideNote || 'Registry and market pulse did not trigger metadata-ghost void.'}`);
+	console.log(`⚖️ [ARBITRATION] ${registryOverrideNote || 'Registry and market pulse did not trigger metadata-ghost void.'}`);
 	const sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'> = [];
 	if (offProduct) sourcesUsed.push('OFF_API');
 	if (scrape.hasContext || marketPulse.used || corporateCrawl.used) sourcesUsed.push('Search_Scrape');
@@ -1800,7 +1791,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 				: 'Strict arbitration used available Serper/Scraper/OFF streams without retry escalation.')
 	};
 
-	console.log(`⚖️ [DECISION] product=${ai.product.name} brand=${ai.product.brand} parent=${ai.product.ultimate_parent}`);
+	console.log(`⚖️ [ARBITRATION] product=${ai.product.name} brand=${ai.product.brand} parent=${ai.product.ultimate_parent}`);
 
 	await cacheScanResult({
 		barcode: ai.barcode,
