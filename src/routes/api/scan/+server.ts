@@ -175,9 +175,9 @@ const STEALTH_USER_AGENTS = [
 ];
 const STEALTH_ACCEPT_LANGUAGES = ['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'en-US,en;q=0.7'];
 const STEALTH_REFERERS = ['https://www.google.com/', 'https://duckduckgo.com/', 'https://www.bing.com/'];
-// For V36 Omni-Sovereign, use a fixed 2s jitter to meet stealth requirements
-const JITTER_MIN_MS = 2000;
-const JITTER_MAX_MS = 2000;
+// V38 uses a wider stealth jitter window to avoid deterministic timing.
+const JITTER_MIN_MS = 1500;
+const JITTER_MAX_MS = 3000;
 const ALLOWED_ORIGINS = new Set([
 	'https://localhost',
 	'https://localhost:5173',
@@ -435,6 +435,9 @@ function inferParentFromEvidence(contextText: string) {
 
 function inferHqCountryFromEvidence(contextText: string) {
 	const normalized = normalizeText(contextText);
+	if (/italian multinational company/i.test(normalized) || /\bitaly\b/i.test(normalized) || (/ferrero/i.test(normalized) && /(alba|piedmont)/i.test(normalized))) {
+		return 'Italy';
+	}
 	const patterns = [
 		/(?:global headquarters|headquarters|hq)\s+(?:is|are|in|located in)\s+([A-Z][A-Za-z\s-]{2,50})/i,
 		/([A-Z][A-Za-z\s-]{2,50})\s*(?:is home to|hosts)\s*(?:the )?(?:global )?headquarters/i
@@ -561,7 +564,7 @@ function buildScrapeHeaders() {
 	const randomizedUserAgent = randomItem(STEALTH_USER_AGENTS);
 	const fingerprint = resolveFingerprintProfile(randomizedUserAgent);
 	console.log(
-		`🕵️ [Fingerprint Status] UA and client hints aligned for ${fingerprint.platform} profile.`
+		`🕵️ [FINGERPRINT] Showing matched headers. UA=${randomizedUserAgent} Sec-CH-UA=${fingerprint.secChUa} Sec-CH-UA-Platform=${fingerprint.platform}`
 	);
 	return {
 		'User-Agent': randomizedUserAgent,
@@ -600,7 +603,6 @@ function summarizeSerperPayload(payload: SerperPayload) {
 	const kg = payload.knowledgeGraph;
 	const kgLine = [kg?.title, kg?.type, kg?.description].map((v) => normalizeText(v)).filter(Boolean).join(' | ');
 	const organicLines = (payload.organic || [])
-		.slice(0, 8)
 		.map((item, idx) => {
 			const title = normalizeText(item.title);
 			const snippet = normalizeText(item.snippet);
@@ -613,8 +615,10 @@ function summarizeSerperPayload(payload: SerperPayload) {
 }
 
 async function serperSearch(query: string) {
-	if (!SEARCH_API_KEY) {
-		return { query, contextText: '', statusCode: 0, used: false };
+	const apiKey = dynamicEnv.SEARCH_API_KEY || SEARCH_API_KEY;
+	if (!apiKey) {
+		console.warn('⚠️ Serper API key missing at runtime (dynamicEnv and static).');
+		return { query, contextText: '', statusCode: 0, used: false, snippetCount: 0 };
 	}
 
 	await applyJitterDelay();
@@ -622,24 +626,29 @@ async function serperSearch(query: string) {
 	const response = await fetch(SERPER_API_URL, {
 		method: 'POST',
 		headers: {
-			'X-API-KEY': SEARCH_API_KEY,
+			'X-API-KEY': apiKey,
 			'Content-Type': 'application/json'
 		},
 		body: JSON.stringify({ q: query, gl: 'us', hl: 'en', num: 10 })
 	});
 
 	if (!response.ok) {
+		console.warn(`📡 [SERPER] ${query} -> status ${response.status}`);
 		return { query, contextText: '', statusCode: response.status, used: false, snippetCount: 0 };
 	}
 
 	const payload = (await response.json()) as SerperPayload;
 	const contextText = summarizeSerperPayload(payload);
+	const snippetCount = payload.organic?.length ?? 0;
+	if (snippetCount > 0) {
+		console.log(`📡 [SERPER] query=${query} snippets=${snippetCount} chars=${contextText.length}`);
+	}
 	return {
 		query,
 		contextText,
 		statusCode: response.status,
 		used: Boolean(contextText),
-		snippetCount: payload.organic?.length ?? 0
+		snippetCount
 	};
 }
 
@@ -673,11 +682,31 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 		snippetCount: 0
 	}));
 
+	if ((retry.snippetCount ?? 0) > 0 || retry.statusCode === 429 || retry.contextText) {
+		return {
+			result: retry,
+			retried: true,
+			primaryQuery,
+			retryQuery,
+			firstAttemptSnippets: primary.snippetCount ?? 0
+		};
+	}
+
+	const fallbackQuery = `EAN ${barcode} manufacturer parent company`;
+	console.log(`🔁 [RETRY] Secondary empty-market search with "${fallbackQuery}".`);
+	const fallback = await serperSearch(fallbackQuery).catch(() => ({
+		query: fallbackQuery,
+		contextText: '',
+		statusCode: 0,
+		used: false,
+		snippetCount: 0
+	}));
+
 	return {
-		result: retry,
+		result: fallback,
 		retried: true,
 		primaryQuery,
-		retryQuery,
+		retryQuery: fallbackQuery,
 		firstAttemptSnippets: primary.snippetCount ?? 0
 	};
 }
@@ -904,39 +933,22 @@ async function callOpenRouterAnalyzer(args: {
 	const offBrand = offBrandParsed.brand || normalizeText(args.offProduct?.brand_owner) || 'Unresolved Brand';
 
 	const systemPrompt = `PROTOCOL META:
-id=PHANTOM_TRIANGULATION_V30_FINAL
-logic_engine=RESILIENT_FINGERPRINT_ARBITRATION
+id=LOGIC_BRIDGE_V38_FINAL
+logic_engine=HIGH_DENSITY_FACT_RECOVERY
 status=ULTIMATE_ACCURACY_ENABLED
 instruction_handling=STRICT_ZERO_SUMMARIZATION. EXECUTE ATOMICALLY.
 
 IMPLEMENTATION MANUAL:
-1) ENV SETUP: Use SEARCH_API_KEY (Serper) to fetch live web snippets.
-2) DATA BUNDLING: Wrap all search results in <registry_data>, <market_pulse>, and <deep_scrape> blocks.
-3) ZERO TRUST: Treat registry metadata as stale until supported by live evidence.
+1) Use the supplied OFF registry, market pulse, and deep scrape as evidence blocks.
+2) Treat registry metadata as incomplete until supported by live evidence.
+3) Prefer the highest-density evidence path when snippets, registry, and crawl disagree.
 
-OBJECTIVE:
-Triangulate product truth across Stream A (OFF registry), Stream B (live market pulse), and Stream C (deep scrape ownership crawl).
-
-Prompt Instruction:
-Analyze all sources for metadata conflicts. If the live Market Pulse contradicts the Registry (due to recycled barcodes or stale data), prioritize the Market Pulse. Identify the product based on the weight of live evidence.
-
-FORENSIC LOGIC GATES:
-Gate 1 - Identity_Override:
-1) Compare <registry_block> (static) vs <market_pulse_block> (live).
-2) If market pulse contradicts registry, immediately void registry.
-3) Treat registry as potentially stale or recycled until market support exists.
-
-Gate 2 - Ownership_Recursion:
-1) Identify ground-truth brand.
-2) Trace with <corporate_crawl_block>: Brand -> Manufacturer -> Ultimate Global Parent.
-3) Apply M&A overrides where needed.
-4) If Brand=SodaStream, note market ownership signals but do NOT hardcode parent mappings; prefer evidence-driven inference.
-5) Ignore legacy owners once current ownership is verified.
-
-Gate 3 - Confidence Triangulation:
-1) Verify consistency across all available streams.
-2) Penalize confidence when only one stream has weak evidence.
-3) Favor live market pulse over stale registry entries when conflict is detected.
+FORENSIC AUDITOR MODE:
+1) Resolve product name, brand, parent, and HQ from the supplied evidence.
+2) If search snippets mention a brand such as Nutella, use internal corporate knowledge to identify the likely ultimate parent and HQ, but do not invent unsupported facts.
+3) If evidence is insufficient, return unresolved rather than fabricating a parent or HQ.
+4) Determine whether the evidence supports an Israeli-related corporate-operation tie using the supplied evidence blocks and audit context.
+5) Keep the reasoning evidence-based and explain which source resolved each field.
 
 DEBUG TELEMETRY MANDATE:
 Every response MUST include telemetry with:
@@ -945,8 +957,8 @@ Every response MUST include telemetry with:
 3) decision_logic (plain explanation of arbitration)
 
 EXECUTION MANDATE:
-1) Market pulse overrides registry 100% when category conflicts.
-2) Never return Unknown if brand identifiers exist in snippets.
+1) Never return Unknown if brand identifiers exist in snippets and the evidence clearly supports a resolution.
+2) When snippets are present but parent is missing, assume parent from brand only if the evidence path supports that inference.
 3) Return valid minified JSON only.
 
 OUTPUT JSON ONLY:
@@ -1450,6 +1462,11 @@ async function cacheScanResult(result: {
 async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const cached = await loadCachedProduct(barcode);
 	if (cached) {
+		const cachedParent = normalizeText(cached.product?.ultimate_parent || cached.parent_company || '');
+		const cachedHq = normalizeText(cached.product?.hq || cached.corporate_structure?.global_hq_country || '');
+		if (isUnresolved(cachedParent) || isUnresolved(cachedHq)) {
+			console.log(`⚠️ [CACHE] Bypassing stale unresolved cache for ${barcode} so live evidence can re-run.`);
+		} else {
 		cached.forensic_report = {
 			scraper_blocked: false,
 			serper_fallback_active: false,
@@ -1464,6 +1481,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 			rationale: 'Loaded from cache; strict forensic audit reused from persisted result.'
 		};
 		return cached;
+		}
 	}
 
 	const [offLookup, marketPulseSearch] = await Promise.all([
@@ -1473,7 +1491,8 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	let marketPulse = marketPulseSearch.result;
 
 	let offProduct = offLookup.product;
-	parseOffBrandDeep(offProduct);
+	const offBrandParsed = parseOffBrandDeep(offProduct);
+	const offBrand = offBrandParsed.brand || normalizeText(offProduct?.brand_owner) || '';
 	let offContext = offProduct ? buildOpenFoodFactsContext(offProduct) : '';
 	console.log(`📥 [OFF] Status: ${offLookup.statusCode}`);
 
@@ -1511,7 +1530,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const offDomain = detectLikelyDomain(offContext);
 	const marketEvidenceContext = serperFallbackActive
 		? marketPulse.contextText || scrape.contextText
-		: scrape.contextText || marketPulse.contextText;
+		: marketPulse.contextText || scrape.contextText;
 	const marketDomain = detectLikelyDomain(marketEvidenceContext);
 	const sodaSignalFromMarket = containsSodaSignals(
 		`${marketPulse.contextText}\n${scrape.contextText}`
@@ -1555,6 +1574,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 
 	const registryData = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
 	const marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
+	const marketPulseForModel = normalizeText(marketPulseData).slice(0, 1500);
 	const deepScrape = corporateCrawl.contextText || scrape.contextText || 'NO_DEEP_SCRAPE_DATA';
 	const ferreroSignalFromSearch = containsFerreroSignals(`${marketPulseData}\n${deepScrape}`);
 	const serperPromotedPrimary = serperFallbackActive || !offContext;
@@ -1636,7 +1656,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const ai = await callOpenRouterAnalyzer({
 		barcode,
 		registryData,
-		marketPulse: marketPulseData,
+		marketPulse: marketPulseForModel,
 		deepScrape,
 		hqPulse: hqPulse.contextText || '',
 		truthBundleBlock,
@@ -1678,10 +1698,30 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	ai.verification_card_label = 'Forensic Audit';
 	// Evidence-driven inference post-analysis: only populate parent/hq if unresolved and we have snippets
 	try {
-		const inferredParent = inferParentFromEvidence(`${marketPulseData}\n${deepScrape}\n${registryData}\n${hqPulse.contextText || ''}`);
+		let inferredParent = inferParentFromEvidence(`${marketPulseData}\n${deepScrape}\n${registryData}\n${hqPulse.contextText || ''}`);
+		if (!inferredParent) {
+			const brandFallback = normalizeText(ai.product?.brand || ai.product_identity?.brand || ai.brand || offBrand || '');
+			if (brandFallback && !isUnresolved(brandFallback)) {
+				inferredParent = brandFallback;
+			}
+		}
 		const inferredHq = inferHqCountryFromEvidence(`${hqPulse.contextText || marketPulseData}\n${deepScrape}`);
+		const brandFallback = normalizeText(ai.product?.brand || ai.product_identity?.brand || ai.brand || offBrand || '');
+		const productNameFallback = normalizeText(ai.product?.name || ai.product_identity?.verified_name || offProduct?.product_name || `Barcode ${barcode}`);
 
 		if (!ai.audit) ai.audit = { parent_evidence: 'No snippet evidence available.', hq_evidence: 'No snippet evidence available.' };
+		if (productNameFallback && isUnresolved(ai.product?.name)) {
+			ai.product.name = productNameFallback;
+			ai.product.verified_name = productNameFallback;
+			ai.product_identity.verified_name = productNameFallback;
+		}
+		if (brandFallback && isUnresolved(ai.product?.brand)) {
+			ai.product.brand = brandFallback;
+			ai.product_identity.brand = brandFallback;
+			ai.product_identity.verified_brand = brandFallback;
+			ai.brand = brandFallback;
+			ai.verified_brand = brandFallback;
+		}
 
 		if (inferredParent && isUnresolved(ai.product?.ultimate_parent)) {
 			const p = inferredParent;
