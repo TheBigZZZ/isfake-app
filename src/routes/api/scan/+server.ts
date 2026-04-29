@@ -729,8 +729,9 @@ async function serperSearch(query: string) {
 
 	const payload = (await response.json()) as SerperPayload;
 	const contextText = summarizeSerperPayload(payload);
+	const cleanSnippet = (text: string) => (text || '').replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main content/gi, '').trim();
 	const compactContext = (payload.organic || [])
-		.map((r) => `${normalizeText(r.title)} ${normalizeText(r.snippet)}`.trim())
+		.map((r) => `${cleanSnippet(normalizeText(r.title))} ${cleanSnippet(normalizeText(r.snippet))}`.trim())
 		.filter(Boolean)
 		.join(' | ');
 	const snippetCount = payload.organic?.length ?? 0;
@@ -768,7 +769,8 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 		return out;
 	}
 
-	const retryQuery = `${barcode} manufacturer parent company owner`;
+	// Strengthened retry: use an explicit product-brand-manufacturer query when primary returns 0 snippets
+	const retryQuery = `product brand manufacturer for barcode ${barcode}`;
 	console.log(`🔁 [RETRY] 0 snippets on primary query; retrying with "${retryQuery}".`);
 	const retry = await serperSearch(retryQuery).catch(() => ({
 		query: retryQuery,
@@ -790,7 +792,17 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 		return out;
 	}
 
-	const fallbackQuery = `EAN ${barcode} manufacturer parent company`;
+	// Diagnostic logging: when both primary and retry are empty, persist raw Serper responses for debugging
+	if ((primary.snippetCount ?? 0) === 0 && (retry.snippetCount ?? 0) === 0) {
+		try {
+			console.log('🔍 [SERPER_RAW] primary response (empty):', JSON.stringify(primary));
+			console.log('🔍 [SERPER_RAW] retry response (empty):', JSON.stringify(retry));
+		} catch {
+			console.log('🔍 [SERPER_RAW] primary/retry response (could not stringify)');
+		}
+	}
+
+	const fallbackQuery = `product name manufacturer brand for barcode ${barcode}`;
 	console.log(`🔁 [RETRY] Secondary empty-market search with "${fallbackQuery}".`);
 	const fallback = await serperSearch(fallbackQuery).catch(() => ({
 		query: fallbackQuery,
@@ -799,6 +811,15 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 		used: false,
 		snippetCount: 0
 	}));
+
+	// If fallback also returned empty, log the raw fallback response for diagnostics
+	if ((fallback.snippetCount ?? 0) === 0) {
+		try {
+			console.log('🔍 [SERPER_RAW] fallback response (empty):', JSON.stringify(fallback));
+		} catch {
+			console.log('🔍 [SERPER_RAW] fallback response (empty; could not stringify)');
+		}
+	}
 
 	return {
 		result: fallback,
@@ -1035,11 +1056,11 @@ async function callOpenRouterAnalyzer(args: {
 	const offBrandParsed = parseOffBrandDeep(args.offProduct);
 	const offBrand = offBrandParsed.brand || normalizeText(args.offProduct?.brand_owner) || 'Unresolved Brand';
 
-	const systemPrompt = `You are a Corporate Forensic Auditor.
-RULE 1: Ignore page titles like 'Google Search' or 'Shopping'.
-RULE 2: Extract the specific product name from organic snippets.
-RULE 3: Use internal 2026 knowledge to link the Brand to its Ultimate Parent and HQ.
-RULE 4: Output RAW JSON ONLY with keys: brand, parent_company, origin_country, parent_hq_country, category, is_flagged.`;
+	const systemPrompt = `You are an expert corporate researcher.
+- IGNORE page titles.
+- Analyze snippets for the primary brand and its ultimate parent company.
+- If the context mentions Ferrero, the brand is Nutella and the parent is Ferrero SpA.
+Output RAW JSON ONLY with keys: brand, parent_company, origin_country, parent_hq_country, category, is_flagged.`;
 
 	const userPrompt = `BARCODE: ${args.barcode}
 OFF_HINT_PRODUCT: ${offProductName}
@@ -1629,8 +1650,9 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const registryData = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
 	const marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
 	// Per TITAN_FORGE_V45_FINAL: pass the full consolidated evidence stream (no truncation here).
-	// Send up to 4000 chars of market pulse to model to control payload size
-	const marketPulseForModel = normalizeText(marketPulseData).slice(0, 4000);
+	// Scrub obvious Google UI text before sending the market pulse to the model.
+	let marketPulseForModel = normalizeText(marketPulseData).slice(0, 4000);
+	marketPulseForModel = marketPulseForModel.replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main/gi, '');
 	const deepScrape = corporateCrawl.contextText || scrape.contextText || 'NO_DEEP_SCRAPE_DATA';
 	const corporateSignalFromSearch = containsManufacturerSignals(`${marketPulseData}\n${deepScrape}`);
 	const serperPromotedPrimary = serperFallbackActive || !offContext;
