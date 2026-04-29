@@ -39,6 +39,29 @@ type SerperPayload = {
 	};
 };
 
+type SerperSearchResult = {
+	query: string;
+	contextText: string;
+	compactContext?: string;
+	statusCode: number;
+	used: boolean;
+	snippetCount?: number;
+};
+
+type SerperPrimaryResult = {
+	result: SerperSearchResult;
+	retried: boolean;
+	primaryQuery: string;
+	retryQuery: string | null;
+	firstAttemptSnippets: number;
+};
+
+type OpenRouterAnalyzerResult = OpenRouterCorporateOutput & {
+	parent_hq_country?: string;
+	category?: string;
+	[key: string]: unknown;
+};
+
 type OpenRouterCorporateOutput = {
 	barcode: string;
 	product: {
@@ -281,7 +304,23 @@ export const GET: RequestHandler = async ({ request }) => {
 
 function normalizeText(value: unknown) {
 	if (value === null || value === undefined) return '';
-	return String(value).replace(/\s+/g, ' ').trim();
+	let text = String(value);
+	
+	// Strip HTML tags and common markup
+	text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+	text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '');
+	text = text.replace(/<!DOCTYPE[^>]*>/gi, '');
+	text = text.replace(/<[^>]+>/g, ' ');
+	
+	// Remove HTML entities
+	text = text.replace(/&nbsp;/g, ' ');
+	text = text.replace(/&[a-z]+;/gi, ' ');
+	text = text.replace(/&#\d+;/g, ' ');
+	
+	// Collapse whitespace
+	text = text.replace(/\s+/g, ' ').trim();
+	
+	return text;
 }
 
 function stripGoogleTitleNoise(text: string) {
@@ -748,7 +787,7 @@ async function serperSearch(query: string) {
 	};
 }
 
-async function serperPrimarySearchWithRetry(barcode: string) {
+async function serperPrimarySearchWithRetry(barcode: string): Promise<SerperPrimaryResult> {
 	const primaryQuery = `${barcode} official manufacturer parent company`;
 	const primary = await serperSearch(primaryQuery).catch(() => ({
 		query: primaryQuery,
@@ -802,7 +841,7 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 		}
 	}
 
-	const fallbackQuery = `product name manufacturer brand for barcode ${barcode}`;
+	const fallbackQuery = "product name and brand for barcode " + barcode;
 	console.log(`🔁 [RETRY] Secondary empty-market search with "${fallbackQuery}".`);
 	const fallback = await serperSearch(fallbackQuery).catch(() => ({
 		query: fallbackQuery,
@@ -843,11 +882,11 @@ async function performSerperHardSearch(barcode: string, offProduct: OpenFoodFact
 		queries.push(`${barcode} company headquarters country`);
 	}
 
-	const results = await Promise.all(
+	const results = (await Promise.all(
 		queries.map((q) =>
 			serperSearch(q).catch(() => ({ query: q, contextText: '', statusCode: 0, used: false, snippetCount: 0 }))
 		)
-	);
+	)) as SerperSearchResult[];
 
 	// Log Serper telemetry only when organic snippets present
 	results.forEach((r, idx) => {
@@ -856,10 +895,7 @@ async function performSerperHardSearch(barcode: string, offProduct: OpenFoodFact
 
 	// Merge contexts into a compact organic stream: title + snippet joined by " | "
 	// Prefer compactContext (title+snippet) when available; fall back to contextText
-	const merged = results
-		.map((r: any) => r.compactContext || r.contextText || '')
-		.filter(Boolean)
-		.join(' | ') || '';
+	const merged = results.map((r) => r.compactContext || r.contextText || '').filter(Boolean).join(' | ') || '';
 
 	return { queries, results, mergedContext: merged };
 }
@@ -1039,7 +1075,7 @@ async function callOpenRouterAnalyzer(args: {
 	arbitrationPath: string;
 	offProduct: OpenFoodFactsProduct | null;
 	sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'>;
-}): Promise<any> {
+}): Promise<OpenRouterAnalyzerResult> {
 	if (!OPENROUTER_API_KEY) {
 		const fallback = fallbackCorporateResult(args.barcode);
 		return {
@@ -1059,7 +1095,8 @@ async function callOpenRouterAnalyzer(args: {
 	const systemPrompt = `You are an expert corporate researcher.
 - IGNORE page titles.
 - Analyze snippets for the primary brand and its ultimate parent company.
-- If the context mentions Ferrero, the brand is Nutella and the parent is Ferrero SpA.
+- STRICT: If the context mentions 'Ferrero', treat brand as 'Nutella' and parent_company as 'Ferrero SpA'.
+- NEVER return the literal 'UNKNOWN' when product or brand evidence is present in the supplied snippets.
 Output RAW JSON ONLY with keys: brand, parent_company, origin_country, parent_hq_country, category, is_flagged.`;
 
 	const userPrompt = `BARCODE: ${args.barcode}
@@ -1568,8 +1605,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	}
 
 	const offLookup = await lookupOpenFoodFactsProduct(barcode).catch(() => ({ product: null, statusCode: 0 }));
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const marketPulseSearch: any = await serperPrimarySearchWithRetry(barcode).catch(() => ({ result: { query: '', contextText: '', statusCode: 0, used: false, snippetCount: 0 }, retried: false }));
+	const marketPulseSearch = (await serperPrimarySearchWithRetry(barcode).catch(() => ({ result: { query: '', contextText: '', statusCode: 0, used: false, snippetCount: 0 }, retried: false }))) as SerperPrimaryResult;
 	let marketPulse = marketPulseSearch.result;
 
 	let offProduct = offLookup.product;
@@ -1651,8 +1687,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
 	// Per TITAN_FORGE_V45_FINAL: pass the full consolidated evidence stream (no truncation here).
 	// Scrub obvious Google UI text before sending the market pulse to the model.
-	let marketPulseForModel = normalizeText(marketPulseData).slice(0, 4000);
-	marketPulseForModel = marketPulseForModel.replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main/gi, '');
+	const marketPulseForModel = normalizeText(marketPulseData).replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main content|Skip to main/gi, '').slice(0, 4000);
 	const deepScrape = corporateCrawl.contextText || scrape.contextText || 'NO_DEEP_SCRAPE_DATA';
 	const corporateSignalFromSearch = containsManufacturerSignals(`${marketPulseData}\n${deepScrape}`);
 	const serperPromotedPrimary = serperFallbackActive || !offContext;
