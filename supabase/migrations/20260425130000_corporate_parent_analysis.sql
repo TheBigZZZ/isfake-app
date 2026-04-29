@@ -3,12 +3,42 @@ alter table public.products
 	add column if not exists origin_country text,
 	add column if not exists is_flagged boolean not null default false;
 
-update public.products
-set
-	brand = coalesce(nullif(brand, ''), nullif(name, ''), 'UNKNOWN BRAND'),
-	parent_company = coalesce(nullif(parent_company, ''), 'UNKNOWN PARENT'),
-	origin_country = coalesce(nullif(origin_country, ''), 'UNKNOWN'),
-	is_flagged = coalesce(is_flagged, is_israeli, false);
+do $$
+begin
+	if exists (
+		select 1
+		from information_schema.columns
+		where table_schema = 'public'
+		  and table_name = 'products'
+		  and column_name = 'name'
+	) then
+		update public.products
+		set
+			brand = coalesce(nullif(brand, ''), nullif(name, ''), 'UNKNOWN BRAND'),
+			parent_company = coalesce(nullif(parent_company, ''), 'UNKNOWN PARENT'),
+			origin_country = coalesce(nullif(origin_country, ''), 'UNKNOWN');
+	else
+		update public.products
+		set
+			brand = coalesce(nullif(brand, ''), 'UNKNOWN BRAND'),
+			parent_company = coalesce(nullif(parent_company, ''), 'UNKNOWN PARENT'),
+			origin_country = coalesce(nullif(origin_country, ''), 'UNKNOWN');
+	end if;
+
+	if exists (
+		select 1
+		from information_schema.columns
+		where table_schema = 'public'
+		  and table_name = 'products'
+		  and column_name = 'is_israeli'
+	) then
+		update public.products
+		set is_flagged = coalesce(is_flagged, is_israeli, false);
+	else
+		update public.products
+		set is_flagged = coalesce(is_flagged, false);
+	end if;
+end $$;
 
 alter table public.products
 	alter column brand set default 'UNKNOWN BRAND',

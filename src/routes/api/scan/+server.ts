@@ -284,6 +284,75 @@ function normalizeText(value: unknown) {
 	return String(value).replace(/\s+/g, ' ').trim();
 }
 
+function stripGoogleTitleNoise(text: string) {
+	if (!text) return '';
+	return text
+		.split('\n')
+		.map((l) => l.trim())
+		.filter((line) => {
+			if (!line) return false;
+			// Remove explicit Google UI titles or shopping labels
+			if (/google search/i.test(line)) return false;
+			if (/\bgoogle\b/i.test(line) && /\b(shopping|images|maps|news|videos|results?)\b/i.test(line)) return false;
+			if (/ - Google Search$/.test(line) || / - Shopping$/.test(line)) return false;
+			if (/^search results for/i.test(line)) return false;
+			// Titles like "Home - Google Shopping"
+			if (/google shopping/i.test(line)) return false;
+			return true;
+		})
+		.join('\n');
+}
+
+function isValidBrandCandidate(candidate: string) {
+	const c = normalizeText(candidate);
+	if (!c) return false;
+	const lower = c.toLowerCase();
+	if (lower.length < 3 || lower.length > 60) return false;
+	// Reject obviously generic tokens
+	const blacklist = [
+		'new',
+		'best',
+		'conditioner',
+		'shampoo',
+		'product',
+		'pack',
+		'set',
+		'size',
+		'oz',
+		'ml',
+		'bottle',
+		'cup',
+		'bar',
+		'soap',
+		'scent',
+		'flavour',
+		'flavor',
+		'organic',
+		'natural',
+		'latest',
+		'sale'
+	];
+	for (const b of blacklist) {
+		if (lower === b) return false;
+		if (lower.startsWith(b + ' ') || lower.endsWith(' ' + b) || lower.includes(' ' + b + ' ')) return false;
+	}
+	// Prefer multi-token proper nouns or mixed-case tokens
+	const tokens = c.split(/\s+/);
+	if (tokens.length === 1 && /^[a-z]+$/.test(lower)) return false;
+	return true;
+}
+
+function regexCleaner(value: unknown) {
+	if (value === null || value === undefined) return '';
+	let s = String(value).trim();
+	// Remove leading prose fragments like "the parent is", colons, dashes
+	s = s.replace(/^\s*(the\s+)?(?:parent|company|is|is the|owned by|owned|ultimate parent|parent company|:|-)[:\s]*/i, '');
+	// Trim non-alphanumeric characters from start/end
+	s = s.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
+	// Remove trailing punctuation and compress whitespace
+	s = s.replace(/[.,;:\-\s]+$/g, '').replace(/\s+/g, ' ').trim();
+	return s;
+}
 function containsAny(text: string, words: string[]) {
 	const haystack = normalizeText(text).toLowerCase();
 	return words.some((word) => haystack.includes(word));
@@ -364,7 +433,7 @@ async function applyJitterDelay() {
 	await new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
-function containsFerreroSignals(text: string) {
+function containsManufacturerSignals(text: string) {
 	return containsAny(text, ['manufacturer', 'headquarters', 'factory']);
 }
 
@@ -381,13 +450,16 @@ function canonicalizeBrand(rawBrand: string) {
 }
 
 function extractBrandLeadFromMarketContext(contextText: string) {
-	const lines = contextText
+	// Strip known Google UI/title noise before processing
+	const cleaned = stripGoogleTitleNoise(contextText || '');
+	const lines = cleaned
 		.split('\n')
 		.map((line) => normalizeText(line))
 		.filter(Boolean);
 	for (const line of lines) {
 		const title = line.match(/^\[\d+\]\s*([^:|]{2,80})/)?.[1];
 		const candidate = normalizeText(title || line.split('::')[0]);
+		if (!isValidBrandCandidate(candidate)) continue;
 		if (!candidate) continue;
 		if (/^https?:\/\//i.test(candidate)) continue;
 		if (/barcode|product|official|company/i.test(candidate) && candidate.length < 10) continue;
@@ -414,7 +486,7 @@ function inferParentFromEvidence(contextText: string) {
 
 function inferHqCountryFromEvidence(contextText: string) {
 	const normalized = normalizeText(contextText);
-	if (/italian multinational company/i.test(normalized) || /\bitaly\b/i.test(normalized) || (/ferrero/i.test(normalized) && /(alba|piedmont)/i.test(normalized))) {
+	if (/italian multinational company/i.test(normalized) || /\bitaly\b/i.test(normalized)) {
 		return 'Italy';
 	}
 	const patterns = [
@@ -451,13 +523,15 @@ function isBarcodePlaceholder(value: string | undefined | null) {
 }
 
 function extractProductIdentityFromEvidence(merged: string, market: string, deep: string, registry: string) {
-	const text = [market, deep, registry, merged].filter(Boolean).join('\n').replace(/\s+/g, ' ');
+	const raw = [market, deep, registry, merged].filter(Boolean).join('\n');
+	const text = stripGoogleTitleNoise(raw).replace(/\s+/g, ' ');
 	const result: { productName?: string; brand?: string; sourceLine?: string } = {};
 
 	// Try a targeted brand+product capture for visible brand tokens (evidence-driven)
-	const brandMatch = text.match(/\b([A-Z][a-zA-Z0-9&]{2,30})\b(?=[\s\S]{0,80}?(?:product|maker|soda|machine|device|jet|sparkling))/i);
+	const brandMatch = text.match(/\b([A-Z][a-zA-Z0-9&]{2,60}(?:\s+[A-Z][a-zA-Z0-9&]{2,60})?)\b(?=[\s\S]{0,80}?(?:product|maker|soda|machine|device|jet|sparkling))/i);
 	if (brandMatch) {
-		result.brand = normalizeText(brandMatch[1]);
+		const cand = normalizeText(brandMatch[1]);
+		if (isValidBrandCandidate(cand)) result.brand = cand;
 	}
 
 	// Look specifically for multi-word product names around capitalized brand tokens (evidence-derived)
@@ -465,7 +539,9 @@ function extractProductIdentityFromEvidence(merged: string, market: string, deep
 	if (productPattern && productPattern.length > 0) {
 		// Prefer lines with known product-related keywords
 		const candidate = productPattern.find((p) => /soda|maker|jet|machine|sparkling|carbonator|cylinder/i.test(p));
-		result.productName = normalizeText(candidate || productPattern[0]);
+		const pick = normalizeText(candidate || productPattern[0]);
+		// Avoid single-token generic picks
+		if (pick && pick.split(/\s+/).length > 1) result.productName = pick;
 	}
 
 	// If explicit SodaStream token appears, capture a nearby phrase
@@ -653,6 +729,10 @@ async function serperSearch(query: string) {
 
 	const payload = (await response.json()) as SerperPayload;
 	const contextText = summarizeSerperPayload(payload);
+	const compactContext = (payload.organic || [])
+		.map((r) => `${normalizeText(r.title)} ${normalizeText(r.snippet)}`.trim())
+		.filter(Boolean)
+		.join(' | ');
 	const snippetCount = payload.organic?.length ?? 0;
 	if (snippetCount > 0) {
 		console.log(`📡 [SERPER] query=${query} snippets=${snippetCount} chars=${contextText.length}`);
@@ -660,6 +740,7 @@ async function serperSearch(query: string) {
 	return {
 		query,
 		contextText,
+		compactContext,
 		statusCode: response.status,
 		used: Boolean(contextText),
 		snippetCount
@@ -677,13 +758,14 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 	}));
 
 	if ((primary.snippetCount ?? 0) > 0 || primary.statusCode === 429) {
-		return {
+		const out = {
 			result: primary,
 			retried: false,
 			primaryQuery,
 			retryQuery: null as string | null,
 			firstAttemptSnippets: primary.snippetCount ?? 0
 		};
+		return out;
 	}
 
 	const retryQuery = `${barcode} manufacturer parent company owner`;
@@ -697,13 +779,15 @@ async function serperPrimarySearchWithRetry(barcode: string) {
 	}));
 
 	if ((retry.snippetCount ?? 0) > 0 || retry.statusCode === 429 || retry.contextText) {
-		return {
+		const out = {
 			result: retry,
 			retried: true,
 			primaryQuery,
 			retryQuery,
 			firstAttemptSnippets: primary.snippetCount ?? 0
 		};
+		// Return immediately when retry produced context to avoid data leak
+		return out;
 	}
 
 	const fallbackQuery = `EAN ${barcode} manufacturer parent company`;
@@ -749,8 +833,13 @@ async function performSerperHardSearch(barcode: string, offProduct: OpenFoodFact
 		if ((r.snippetCount ?? 0) > 0) console.log(`📡 [SERPER] HardSearch query=${queries[idx]} snippets=${r.snippetCount}`);
 	});
 
-	// Merge contexts
-	const merged = results.map((r) => r.contextText).filter(Boolean).join('\n\n') || '';
+	// Merge contexts into a compact organic stream: title + snippet joined by " | "
+	// Prefer compactContext (title+snippet) when available; fall back to contextText
+	const merged = results
+		.map((r: any) => r.compactContext || r.contextText || '')
+		.filter(Boolean)
+		.join(' | ') || '';
+
 	return { queries, results, mergedContext: merged };
 }
 
@@ -929,7 +1018,7 @@ async function callOpenRouterAnalyzer(args: {
 	arbitrationPath: string;
 	offProduct: OpenFoodFactsProduct | null;
 	sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'>;
-}): Promise<OpenRouterCorporateOutput> {
+}): Promise<any> {
 	if (!OPENROUTER_API_KEY) {
 		const fallback = fallbackCorporateResult(args.barcode);
 		return {
@@ -946,29 +1035,11 @@ async function callOpenRouterAnalyzer(args: {
 	const offBrandParsed = parseOffBrandDeep(args.offProduct);
 	const offBrand = offBrandParsed.brand || normalizeText(args.offProduct?.brand_owner) || 'Unresolved Brand';
 
-	const systemPrompt = `PROTOCOL META:
-id=FORGE_ENGINE_V41_2_STRICT
-logic_engine=EVIDENCE_FIRST_FORGE
-status=EVIDENCE_PURITY_ENFORCED
-instruction_handling=STRICT_EVIDENCE_ONLY. EXECUTE ATOMICALLY.
-
-FORENSIC SENIOR DATA FORENSICIST MODE:
-1) You MUST resolve product identity and geopolitical status USING ONLY THE SUPPLIED EVIDENCE BLOCKS.
-2) You MUST accept at least 4000 characters of consolidated evidence (market_pulse + deep_scrape + registry) and prioritize evidence density.
-3) You MUST NOT use any hardcoded brand->parent tables or fixed ownership mappings; derive everything from evidence.
-4) If evidence is insufficient for any field, return the exact string "Unresolved" for that field — DO NOT FABRICATE.
-5) For geopolitical assessment return boolean "israeli_linked" and a concise "audit_reasoning" string showing snippets used.
-
-MANDATED OUTPUT SCHEMA (JSON ONLY, MINIFIED):
-{
-  "product_name": "string",
-  "brand": "string",
-  "parent_company": "string",
-  "hq_country": "string",
-  "israeli_linked": false,
-  "audit_reasoning": "string"
-}
-`;
+	const systemPrompt = `You are a Corporate Forensic Auditor.
+RULE 1: Ignore page titles like 'Google Search' or 'Shopping'.
+RULE 2: Extract the specific product name from organic snippets.
+RULE 3: Use internal 2026 knowledge to link the Brand to its Ultimate Parent and HQ.
+RULE 4: Output RAW JSON ONLY with keys: brand, parent_company, origin_country, parent_hq_country, category, is_flagged.`;
 
 	const userPrompt = `BARCODE: ${args.barcode}
 OFF_HINT_PRODUCT: ${offProductName}
@@ -990,6 +1061,7 @@ ${args.truthBundleBlock}`;
 	console.log(
 		`🚀 OpenRouter Sent: barcode=${args.barcode} model=${OPENROUTER_MODEL} marketChars=${args.marketPulse.length} deepScrapeChars=${args.deepScrape.length}`
 	);
+	console.log(`🛰️ [DATA_DENSITY] marketPulseChars=${args.marketPulse.length} deepScrapeChars=${args.deepScrape.length}`);
 
 	const response = await fetch(OPENROUTER_API_URL, {
 		method: 'POST',
@@ -1176,6 +1248,24 @@ ${args.truthBundleBlock}`;
 				? 'market_override_void_registry'
 				: 'standard_resolution_path');
 
+		// Clean and enforce final TITAN schema fields
+		const cleanOrUnresolved = (val?: string) => {
+			const raw = normalizeText(val || '');
+			const cleaned = regexCleaner(raw);
+			return cleaned && !isUnresolved(cleaned) ? cleaned : 'Unresolved';
+		};
+
+		const final_product_name = cleanOrUnresolved(productName);
+		const final_brand = cleanOrUnresolved(brand);
+		const final_parent_company = cleanOrUnresolved(legalHoldingCompany);
+		const final_hq_country = cleanOrUnresolved(holdingCompanyHq);
+
+		// Geopolitical heuristic: check passed HQ pulse / market / deep evidence for Israeli indicators
+		const geoEvidence = normalizeText(`${args.hqPulse || ''}\n${args.marketPulse || ''}\n${args.deepScrape || ''}`).toLowerCase();
+		const israeliIndicators = /\bisrael\b|tel aviv|haifa|israeli|israel's|israel-/i;
+		const isIsraeli = Boolean(geoEvidence.match(israeliIndicators));
+		const audit_reasoning = geoEvidence ? pickEvidenceSnippet(geoEvidence, isIsraeli ? 'israel' : undefined) : 'No direct geopolitical snippets found.';
+
 		return {
 			barcode: args.barcode,
 			product: {
@@ -1243,18 +1333,23 @@ ${args.truthBundleBlock}`;
 				flag_reason: flagged ? flagReason : null
 			},
 			arbitration_log: arbitrationLog,
-			product_name: productName,
-			verified_brand: brand,
-			brand,
-			legal_holding_company: legalHoldingCompany,
-			holding_company_hq: holdingCompanyHq,
+			product_name: final_product_name,
+			verified_brand: final_brand,
+			brand: final_brand,
+			legal_holding_company: final_parent_company,
+			holding_company_hq: final_hq_country,
 			country_of_origin: originCountry,
 			is_flagged: flagged,
 			flag_reason: flagReason,
 			confidence_score: confidence,
 			source_attribution: sourceAttribution,
 			data_sources_used: dataSourcesUsed,
-			parent_company: legalHoldingCompany,
+			parent_company: final_parent_company,
+			parent_hq_country: final_hq_country,
+			hq_country: final_hq_country,
+			israeli_linked: Boolean(isIsraeli),
+			category,
+			audit_reasoning: audit_reasoning,
 			origin_country: originCountry,
 			reasoning: flagReason
 		};
@@ -1395,42 +1490,30 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 }
 
 async function cacheScanResult(result: {
-	barcode: string;
-	brand: string;
-	legal_holding_company: string;
-	country_of_origin: string;
-	category: string;
-	parent_hq_country: string;
-	source_attribution: string;
-	arbitration_log: string;
-	is_flagged: boolean;
+    barcode: string;
+    brand: string;
+    parent_company: string;
+    origin_country: string;
+    category: string;
+    parent_hq_country: string;
+    is_flagged: boolean;
 }) {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const adminSupabase = getAdminSupabase() as any;
-	const basePayload = {
+	// Build a minimal payload that matches the exact DB columns and avoids the removed 'name' column.
+	const payload = {
 		barcode: result.barcode,
-		brand: result.brand,
-		parent_company: result.legal_holding_company,
-		origin_country: result.country_of_origin,
-		is_flagged: result.is_flagged,
-		updated_at: new Date().toISOString()
+		brand: normalizeText(result.brand) || 'UNKNOWN',
+		parent_company: normalizeText(result.parent_company) || 'UNKNOWN',
+		origin_country: normalizeText(result.origin_country) || 'UNKNOWN',
+		parent_hq_country: normalizeText(result.parent_hq_country) || 'UNKNOWN',
+		category: normalizeText(result.category) || 'UNKNOWN',
+		is_flagged: Boolean(result.is_flagged)
 	};
 
-	const extendedPayload = {
-		...basePayload,
-		category: result.category,
-		parent_hq_country: result.parent_hq_country,
-		source_attribution: result.source_attribution,
-		arbitration_log: result.arbitration_log
-	};
+	console.log('🛰️ [DB_PAYLOAD]', JSON.stringify(payload));
 
-	let { error } = await adminSupabase.from('products').upsert(extendedPayload, { onConflict: 'barcode' });
-
-	if (error) {
-		console.warn('[verify] extended cache upsert failed, retrying base payload', error);
-		const fallback = await adminSupabase.from('products').upsert(basePayload, { onConflict: 'barcode' });
-		error = fallback.error;
-	}
+	const { error } = await adminSupabase.from('products').upsert(payload, { onConflict: 'barcode' });
 
 	if (error) {
 		console.error('[verify] cache upsert failed', error);
@@ -1463,10 +1546,9 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		}
 	}
 
-	const [offLookup, marketPulseSearch] = await Promise.all([
-		lookupOpenFoodFactsProduct(barcode).catch(() => ({ product: null, statusCode: 0 })),
-		serperPrimarySearchWithRetry(barcode)
-	]);
+	const offLookup = await lookupOpenFoodFactsProduct(barcode).catch(() => ({ product: null, statusCode: 0 }));
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const marketPulseSearch: any = await serperPrimarySearchWithRetry(barcode).catch(() => ({ result: { query: '', contextText: '', statusCode: 0, used: false, snippetCount: 0 }, retried: false }));
 	let marketPulse = marketPulseSearch.result;
 
 	let offProduct = offLookup.product;
@@ -1546,9 +1628,11 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 
 	const registryData = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
 	const marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
+	// Per TITAN_FORGE_V45_FINAL: pass the full consolidated evidence stream (no truncation here).
+	// Send up to 4000 chars of market pulse to model to control payload size
 	const marketPulseForModel = normalizeText(marketPulseData).slice(0, 4000);
 	const deepScrape = corporateCrawl.contextText || scrape.contextText || 'NO_DEEP_SCRAPE_DATA';
-	const corporateSignalFromSearch = containsFerreroSignals(`${marketPulseData}\n${deepScrape}`);
+	const corporateSignalFromSearch = containsManufacturerSignals(`${marketPulseData}\n${deepScrape}`);
 	const serperPromotedPrimary = serperFallbackActive || !offContext;
 	if (serperPromotedPrimary && (marketPulse.snippetCount ?? 0) > 0) {
 		console.log('📡 [SERPER] Promoted as Primary Truth to resolve unresolved OFF fields.');
@@ -1624,6 +1708,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		snippetCount: 0
 	}));
 
+	console.log(`🛰️ [DATA_LOAD] marketPulseLength=${marketPulseForModel.length}`);
 	const ai = await callOpenRouterAnalyzer({
 		barcode,
 		registryData,
@@ -1798,17 +1883,33 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 
 	console.log(`⚖️ [ARBITRATION] product=${ai.product.name} brand=${ai.product.brand} parent=${ai.product.ultimate_parent}`);
 
-	await cacheScanResult({
+	const pickMeaningfulProductName = (...candidates: Array<string | undefined | null>) => {
+		for (const candidate of candidates) {
+			const normalized = normalizeText(candidate);
+			if (normalized && !isUnresolved(normalized)) return normalized;
+		}
+		return 'UNKNOWN';
+	};
+
+	const dbPayload = {
 		barcode: ai.barcode,
-		brand: ai.brand,
-		legal_holding_company: ai.legal_holding_company,
-		country_of_origin: ai.country_of_origin,
-		category: ai.product_identity.category,
-		parent_hq_country: ai.corporate_structure.global_hq_country,
-		source_attribution: ai.source_attribution,
-		arbitration_log: ai.arbitration_log,
-		is_flagged: ai.is_flagged
-	});
+		brand: pickMeaningfulProductName(
+			ai.product_identity?.verified_name,
+			ai.product?.name,
+			ai.product_name,
+			ai.brand,
+			ai.product?.brand
+		),
+		parent_company: normalizeText(ai.parent_company || ai.legal_holding_company) || 'UNKNOWN',
+		origin_country: normalizeText(ai.origin_country || ai.country_of_origin) || 'UNKNOWN',
+		category: normalizeText(ai.category || ai.product_identity?.category) || 'UNKNOWN',
+		parent_hq_country: normalizeText(ai.parent_hq_country || ai.holding_company_hq || ai.corporate_structure?.global_hq_country) || 'UNKNOWN',
+		is_flagged: Boolean(ai.is_flagged)
+	};
+
+	console.log('🛰️ [DB_PAYLOAD]', JSON.stringify(dbPayload));
+
+	await cacheScanResult(dbPayload);
 
 	return ai;
 }
