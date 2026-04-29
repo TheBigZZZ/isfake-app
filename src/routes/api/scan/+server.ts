@@ -841,7 +841,7 @@ async function serperPrimarySearchWithRetry(barcode: string): Promise<SerperPrim
 		}
 	}
 
-	const fallbackQuery = "product manufacturer brand and owner for barcode " + barcode;
+	const fallbackQuery = "exact product brand name and manufacturer for barcode " + barcode;
 	console.log(`🔁 [RETRY] Secondary empty-market search with "${fallbackQuery}".`);
 	const fallback = await serperSearch(fallbackQuery).catch(() => ({
 		query: fallbackQuery,
@@ -1096,6 +1096,7 @@ async function callOpenRouterAnalyzer(args: {
 - Identify brand and ultimate parent company based ONLY on provided evidence.
 - Do NOT reference external knowledge or hardcoded examples.
 - Extract corporate structure: brand, parent company, origin, headquarters country, category, flagged status.
+- STRICT: Disregard all navigation text. If the text contains corporate names like 'Ferrero' or 'Nestle', identify the brand identity from the descriptive snippets only.
 Output RAW JSON ONLY with keys: brand, parent_company, origin_country, parent_hq_country, category, is_flagged.`;
 
 	const userPrompt = `BARCODE: ${args.barcode}
@@ -1685,8 +1686,11 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 
 	const registryData = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
 	let marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
-	// Aggressive Google UI noise stripping before AI reads context
-	marketPulseData = marketPulseData.replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main|All filters|Tools|SafeSearch/gi, '');
+	// Exhaustive Google UI noise stripping before AI reads context
+	marketPulseData = marketPulseData.replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main content|All filters|Tools|SafeSearch|About these results|More results|Feedback|Privacy|Terms/gi, '');
+	// Log cleaned context size and preview for auditing (mandated V81)
+	console.log('🛰️ [DATA_LOAD]', marketPulseData.length);
+	console.log('📝 [CLEAN_CONTEXT]', marketPulseData.substring(0, 200));
 	// Per TITAN_FORGE_V45_FINAL: pass the full consolidated evidence stream
 	const marketPulseForModel = normalizeText(marketPulseData).slice(0, 4000);
 
