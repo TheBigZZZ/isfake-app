@@ -969,7 +969,7 @@ async function semanticGoogleScrape(barcode: string) {
 		blocked: response.status === 403 || response.status === 429,
 		hasContext: Boolean(contextText),
 		statusCode: response.status,
-		contextText
+		contextText: normalizeText(contextText)
 	};
 }
 
