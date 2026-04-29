@@ -1614,6 +1614,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	let offContext = offProduct ? buildOpenFoodFactsContext(offProduct) : '';
 	console.log(`📥 [OFF] Status: ${offLookup.statusCode}`);
 
+
 	const scrape = await semanticGoogleScrape(barcode).catch(() => ({
 		blocked: true,
 		hasContext: false,
@@ -1687,8 +1688,16 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	const marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
 	// Per TITAN_FORGE_V45_FINAL: pass the full consolidated evidence stream (no truncation here).
 	// Scrub obvious Google UI text before sending the market pulse to the model.
+
 	const marketPulseForModel = normalizeText(marketPulseData).replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main content|Skip to main/gi, '').slice(0, 4000);
+
+	console.log(`🔍 [DEBUG] corporateCrawl.contextText.length=${corporateCrawl.contextText?.length || 0}`);
+	console.log(`🔍 [DEBUG] scrape.contextText.length=${scrape.contextText?.length || 0}`);
+
 	const deepScrape = corporateCrawl.contextText || scrape.contextText || 'NO_DEEP_SCRAPE_DATA';
+
+	console.log(`🔍 [DEBUG] deepScrape final length=${deepScrape.length} first100chars=${deepScrape.slice(0, 100)}`);
+
 	const corporateSignalFromSearch = containsManufacturerSignals(`${marketPulseData}\n${deepScrape}`);
 	const serperPromotedPrimary = serperFallbackActive || !offContext;
 	if (serperPromotedPrimary && (marketPulse.snippetCount ?? 0) > 0) {
