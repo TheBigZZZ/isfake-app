@@ -841,7 +841,7 @@ async function serperPrimarySearchWithRetry(barcode: string): Promise<SerperPrim
 		}
 	}
 
-	const fallbackQuery = "product name and brand for barcode " + barcode;
+	const fallbackQuery = "product manufacturer brand and owner for barcode " + barcode;
 	console.log(`🔁 [RETRY] Secondary empty-market search with "${fallbackQuery}".`);
 	const fallback = await serperSearch(fallbackQuery).catch(() => ({
 		query: fallbackQuery,
@@ -1092,11 +1092,10 @@ async function callOpenRouterAnalyzer(args: {
 	const offBrandParsed = parseOffBrandDeep(args.offProduct);
 	const offBrand = offBrandParsed.brand || normalizeText(args.offProduct?.brand_owner) || 'Unresolved Brand';
 
-	const systemPrompt = `You are an expert corporate researcher.
-- IGNORE page titles.
-- Analyze snippets for the primary brand and its ultimate parent company.
-- STRICT: If the context mentions 'Ferrero', treat brand as 'Nutella' and parent_company as 'Ferrero SpA'.
-- NEVER return the literal 'UNKNOWN' when product or brand evidence is present in the supplied snippets.
+	const systemPrompt = `You are a Global Corporate Researcher.
+- Identify brand and ultimate parent company based ONLY on provided evidence.
+- Do NOT reference external knowledge or hardcoded examples.
+- Extract corporate structure: brand, parent company, origin, headquarters country, category, flagged status.
 Output RAW JSON ONLY with keys: brand, parent_company, origin_country, parent_hq_country, category, is_flagged.`;
 
 	const userPrompt = `BARCODE: ${args.barcode}
@@ -1685,11 +1684,11 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	}
 
 	const registryData = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
-	const marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
-	// Per TITAN_FORGE_V45_FINAL: pass the full consolidated evidence stream (no truncation here).
-	// Scrub obvious Google UI text before sending the market pulse to the model.
-
-	const marketPulseForModel = normalizeText(marketPulseData).replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main content|Skip to main/gi, '').slice(0, 4000);
+	let marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
+	// Aggressive Google UI noise stripping before AI reads context
+	marketPulseData = marketPulseData.replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main|All filters|Tools|SafeSearch/gi, '');
+	// Per TITAN_FORGE_V45_FINAL: pass the full consolidated evidence stream
+	const marketPulseForModel = normalizeText(marketPulseData).slice(0, 4000);
 
 	console.log(`🔍 [DEBUG] corporateCrawl.contextText.length=${corporateCrawl.contextText?.length || 0}`);
 	console.log(`🔍 [DEBUG] scrape.contextText.length=${scrape.contextText?.length || 0}`);
@@ -1774,7 +1773,8 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		snippetCount: 0
 	}));
 
-	console.log(`🛰️ [DATA_LOAD] marketPulseLength=${marketPulseForModel.length}`);
+	console.log('🛰️ [DATA_LOAD]', marketPulseData.length);
+	console.log('📝 [CLEAN_PREVIEW]', marketPulseData.substring(0, 150));
 	const ai = await callOpenRouterAnalyzer({
 		barcode,
 		registryData,
