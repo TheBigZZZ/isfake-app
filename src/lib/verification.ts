@@ -1,5 +1,9 @@
 export type VerificationResult = {
 	barcode: string;
+	scan_guidance?: {
+		next_step: 'camera_ocr' | string;
+		message: string;
+	};
 	product_identity?: {
 		verified_name: string;
 		brand: string;

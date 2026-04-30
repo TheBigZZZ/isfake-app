@@ -8,7 +8,16 @@ const verifyApiUrl = import.meta.env.VITE_VERIFY_API_URL?.replace(/\/$/, '') || 
 
 export const supabase = createClient(supabaseUrl, supabaseKey);
 
-async function postVerificationRequest(body: Record<string, unknown>): Promise<VerificationResult> {
+type ScanRequestBody = {
+	barcode?: string;
+	action?: 'scan';
+	ocr_text?: string;
+	image_data_url?: string;
+	image_base64?: string;
+	image_url?: string;
+};
+
+async function postVerificationRequest(body: ScanRequestBody): Promise<VerificationResult> {
 	const response = await fetch(verifyApiUrl, {
 		method: 'POST',
 		headers: {
@@ -38,4 +47,8 @@ async function postVerificationRequest(body: Record<string, unknown>): Promise<V
 
 export async function verifyBarcode(barcode: string) {
 	return postVerificationRequest({ barcode, action: 'scan' });
+}
+
+export async function verifyScan(barcode?: string, extras: Omit<ScanRequestBody, 'barcode' | 'action'> = {}) {
+	return postVerificationRequest({ ...(barcode ? { barcode } : {}), action: 'scan', ...extras });
 }

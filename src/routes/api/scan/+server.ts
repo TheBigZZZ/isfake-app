@@ -8,6 +8,10 @@ import { getAdminSupabase } from '$lib/server/supabase';
 type VerifyBody = {
 	barcode?: string;
 	action?: 'scan';
+	ocr_text?: string;
+	image_data_url?: string;
+	image_base64?: string;
+	image_url?: string;
 };
 
 type OpenFoodFactsProduct = {
@@ -57,6 +61,245 @@ type SerperPrimaryResult = {
 	firstAttemptSnippets: number;
 };
 
+type PublicVerificationResult = {
+	company: string;
+	hqCountry: string;
+	website: string;
+	source: 'Wikidata' | 'OfficialSite' | 'Registry';
+	score: number;
+	evidence: string;
+};
+
+type EvidenceBundle = {
+	product_name: string;
+	brand: string;
+	parent_company: string;
+	parent_hq_country: string;
+	origin_country: string;
+	category: string;
+	sources: string[];
+};
+
+type VerifiedField = {
+	value: string | boolean;
+	accepted: boolean;
+	confidence: number; // 0-1
+	supporting_sources: Array<{ source: string; url?: string; excerpt?: string }>;
+	reason?: string;
+};
+
+type VerifiedResult = {
+	brand: VerifiedField;
+	parent_company: VerifiedField;
+	parent_hq_country: VerifiedField;
+	origin_country: VerifiedField;
+	category: VerifiedField;
+	is_flagged: VerifiedField;
+	overall_confidence: number;
+	notes?: string[];
+};
+
+type ScanQuota = {
+	allowed: boolean;
+	plan: 'free' | 'supporter';
+	scansRemaining: number;
+	reason?: string;
+};
+
+type BarcodeValidation = {
+	valid: boolean;
+	type: 'EAN-8' | 'EAN-13' | 'UPC-A' | 'GTIN-14' | 'unknown';
+	digits: string;
+	gs1Country?: string;
+	error?: string;
+};
+
+type UPCItemDBResult = {
+	title: string;
+	brand: string;
+	category: string;
+	description: string;
+};
+
+type ScanEvidenceInput = {
+	ocr_text?: string;
+	image_data_url?: string;
+	image_base64?: string;
+	image_url?: string;
+};
+
+async function runLLMSelfCheck(args: {
+	barcode: string;
+	evidenceBundleBlock: string;
+	aiSnapshot: unknown;
+	marketPulse: string;
+	deepScrape: string;
+	registryData: string;
+	hqPulse: string;
+}): Promise<Partial<VerifiedResult> | null> {
+	if (!OPENROUTER_API_KEY) return null;
+
+	try {
+		// Reuse callOpenRouterAnalyzer path as a best-effort LLM verifier by asking for a compact JSON
+		const verificationPrompt = `You are a verifier. Given the AI's extracted fields and the following evidence (OFF registry, market snippets, deep scrape, HQ pulse), return a JSON object with fields: brand, parent_company, parent_hq_country, origin_country, category, is_flagged. For each field include {value, accept:true|false, confidence:0-1, supporting_sources:[{source,url,excerpt}], reason}. Evidence: ${args.evidenceBundleBlock}\n\nAI_OUTPUT:${JSON.stringify(
+			args.aiSnapshot
+		)}\n\nMARKET_PULSE:${args.marketPulse}\n\nDEEP_SCRAPE:${args.deepScrape}\n\nREGISTRY:${args.registryData}\n\nHQ_PULSE:${args.hqPulse}`;
+
+		// Build typed args for callOpenRouterAnalyzer so it routes through the existing OpenRouter flow
+		const verifierArgsForCall = {
+			barcode: args.barcode,
+			registryData: args.registryData,
+			marketPulse: args.marketPulse,
+			offData: args.registryData,
+			searchContext: args.marketPulse,
+			deepScrape: args.deepScrape,
+			hqPulse: args.hqPulse,
+			truthBundleBlock: `VERIFIER_PROMPT:\n${verificationPrompt}`,
+			evidenceBundle: args.evidenceBundleBlock,
+			contextText: `${args.marketPulse}\n${args.deepScrape}\n${args.registryData}`,
+			searchPresent: Boolean(args.marketPulse || args.deepScrape),
+			snippetsCount: 0,
+			keyIndicators: [],
+			arbitrationPath: 'llm_self_check',
+			offProduct: null,
+			sourcesUsed: ['Search_Scrape'] as Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'>
+		} as Parameters<typeof callOpenRouterAnalyzer>[0];
+
+		const llmResult = await callOpenRouterAnalyzer(verifierArgsForCall).catch(() => null);
+
+		if (!llmResult) return null;
+
+		// Map available ai-like fields into VerifiedResult partial structure
+		const mapField = (val: unknown, src = 'LLM'): VerifiedField | undefined => {
+			if (val === undefined || val === null) return undefined;
+			const s = String(val);
+			return {
+				value: s,
+				accepted: true,
+				confidence: s.length > 0 ? 0.8 : 0.5,
+				supporting_sources: [{ source: src }],
+				reason: 'Verified by LLM self-check'
+			} as VerifiedField;
+		};
+
+		const partial: Partial<VerifiedResult> = {};
+		partial.brand = mapField(llmResult.product?.brand || llmResult.brand) || undefined;
+		partial.parent_company = mapField(llmResult.product?.ultimate_parent || llmResult.parent_company) || undefined;
+		partial.parent_hq_country = mapField(llmResult.product?.hq || llmResult.parent_hq_country) || undefined;
+		partial.origin_country = mapField(llmResult.origin_data?.physical_origin || llmResult.origin_country) || undefined;
+		partial.category = mapField(llmResult.product_identity?.category || llmResult.category) || undefined;
+		partial.is_flagged = { value: !!llmResult.compliance?.is_flagged || false, accepted: false, confidence: 0.2, supporting_sources: [] };
+
+		return partial;
+	} catch {
+		return null;
+	}
+}
+
+function scoreAndDecideField(fieldName: string, aiValue: string, offValue: string | null, publicVerification: PublicVerificationResult | null, marketText: string, deepScrape: string, llmSelf?: Partial<VerifiedResult>, hqAnchor?: string): VerifiedField {
+	const supporting_sources: VerifiedField['supporting_sources'] = [];
+	const normalizedAi = normalizeText(aiValue || '');
+	const normalizedOff = normalizeText(offValue || '');
+	const normalizedHqAnchor = normalizeText(hqAnchor || '');
+
+	// Official/Wikidata strong accept
+	if (publicVerification && publicVerification.company) {
+		if (fieldName === 'parent_company') {
+			supporting_sources.push({ source: `Official:${publicVerification.source}`, url: publicVerification.website, excerpt: publicVerification.evidence });
+			return { value: publicVerification.company, accepted: true, confidence: 0.95, supporting_sources, reason: 'Official/Wikidata match' };
+		}
+		if (
+			fieldName === 'parent_hq_country' &&
+			publicVerification.hqCountry &&
+			(normalizeText(publicVerification.source) === 'OfficialSite' || normalizeText(publicVerification.source) === 'Registry') &&
+			normalizedHqAnchor &&
+			companyHasHqEvidence(normalizedHqAnchor, `${publicVerification.evidence}\n${publicVerification.website}`, normalizedHqAnchor)
+		) {
+			supporting_sources.push({ source: `Official:${publicVerification.source}`, url: publicVerification.website, excerpt: publicVerification.evidence });
+			return { value: publicVerification.hqCountry, accepted: true, confidence: 0.95, supporting_sources, reason: 'Official/Wikidata HQ match' };
+		}
+	}
+
+	// OFF authoritative for origin and category
+	if (fieldName === 'origin_country' && normalizedOff) {
+		supporting_sources.push({ source: 'OFF' });
+		return { value: normalizedOff, accepted: true, confidence: 0.95, supporting_sources, reason: 'OFF authoritative' };
+	}
+	if (fieldName === 'category' && normalizedOff) {
+		supporting_sources.push({ source: 'OFF' });
+		return { value: normalizedOff, accepted: true, confidence: 0.9, supporting_sources, reason: 'OFF authoritative' };
+	}
+
+	// If LLM self-check suggests a value with high confidence, accept it
+	const llmField = fieldName === 'parent_hq_country' ? undefined : llmSelf ? (llmSelf as unknown as Record<string, VerifiedField | undefined>)[fieldName] : undefined;
+	if (llmField && llmField.accepted && llmField.confidence >= 0.8) {
+		supporting_sources.push({ source: 'LLM-self-check' });
+		return { value: llmField.value as string, accepted: true, confidence: llmField.confidence, supporting_sources, reason: 'LLM self-check accepted' };
+	}
+
+	// Snippet-based acceptance: require at least 2 independent signals across market + deepScrape
+	const snippetText = `${marketText || ''}\n${deepScrape || ''}`;
+	let evidenceScore = 0;
+	if (fieldName === 'parent_company') {
+		if (companyValueHasEvidenceSupport(aiValue, snippetText)) evidenceScore += 1;
+		if (companyValueHasEvidenceSupport(normalizedOff, snippetText)) evidenceScore += 1;
+		if (publicVerification && publicVerification.company && publicVerification.company.toLowerCase() === normalizedAi.toLowerCase()) evidenceScore += 2;
+	}
+	if (fieldName === 'parent_hq_country') {
+		if (normalizedHqAnchor && companyHasHqEvidence(normalizedHqAnchor, snippetText, normalizedHqAnchor)) evidenceScore += 2;
+		if (normalizedHqAnchor && inferHqCountryFromEvidence(snippetText, normalizedHqAnchor) === aiValue) evidenceScore += 1;
+		if (publicVerification && (publicVerification.source === 'OfficialSite' || publicVerification.source === 'Registry') && inferCountryFromText(publicVerification.hqCountry) === normalizedAi) evidenceScore += 2;
+	}
+	if (fieldName === 'origin_country') {
+		if (inferOriginCountryFromEvidence(snippetText) === aiValue) evidenceScore += 2;
+	}
+
+	const minimumEvidenceScore = fieldName === 'parent_hq_country' ? 3 : 2;
+	if (evidenceScore >= minimumEvidenceScore) {
+		supporting_sources.push({ source: 'Serper/Scraper corroboration' });
+		return { value: aiValue || (normalizedOff || 'Unresolved'), accepted: true, confidence: 0.75, supporting_sources, reason: 'Corroborated by >=2 snippets' };
+	}
+
+	// Last resort: accept AI if it matches OFF or appears in snippet once together with AI confidence
+	if (normalizedAi && (normalizedAi === normalizedOff || normalizedAi.length > 3 && snippetText.toLowerCase().includes(normalizedAi.toLowerCase()))) {
+		supporting_sources.push({ source: 'AI+Snippets' });
+		return { value: aiValue, accepted: true, confidence: 0.6, supporting_sources, reason: 'AI value appears in snippets or matches OFF' };
+	}
+
+	// Reject by default; prefer OFF/Official/Wikidata or remain unresolved
+	return { value: aiValue || 'Unresolved', accepted: false, confidence: 0.2, supporting_sources, reason: 'Insufficient corroborating evidence; rejected by verifier' };
+}
+
+function applyVerificationToAi(ai: unknown, verified: VerifiedResult) {
+	const target = ai as unknown as Record<string, unknown>;
+	// Apply accepted fields back onto ai result
+	if (verified.brand && verified.brand.accepted) (target as Record<string, unknown>)['brand'] = String(verified.brand.value) as unknown;
+	if (verified.parent_company && verified.parent_company.accepted) {
+		(target as Record<string, unknown>)['parent_company'] = String(verified.parent_company.value) as unknown;
+		const prod = ((target as Record<string, unknown>)['product'] as Record<string, unknown> | undefined) || ({} as Record<string, unknown>);
+		prod['ultimate_parent'] = String(verified.parent_company.value) as unknown;
+		(target as Record<string, unknown>)['product'] = prod as unknown;
+	}
+	if (verified.parent_hq_country && verified.parent_hq_country.accepted) {
+		(target as Record<string, unknown>)['parent_hq_country'] = String(verified.parent_hq_country.value) as unknown;
+		(target as Record<string, unknown>)['holding_company_hq'] = String(verified.parent_hq_country.value) as unknown;
+		const prod = (target as Record<string, unknown>)['product'] as Record<string, unknown> | undefined;
+		if (prod) prod['hq'] = String(verified.parent_hq_country.value) as unknown;
+	}
+	if (verified.origin_country && verified.origin_country.accepted) {
+		(target as Record<string, unknown>)['origin_country'] = String(verified.origin_country.value) as unknown;
+		(target as Record<string, unknown>)['country_of_origin'] = String(verified.origin_country.value) as unknown;
+	}
+	if (verified.category && verified.category.accepted) {
+		(target as Record<string, unknown>)['category'] = String(verified.category.value) as unknown;
+		const pid = (target as Record<string, unknown>)['product_identity'] as Record<string, unknown> | undefined;
+		if (pid) pid['category'] = String(verified.category.value) as unknown;
+	}
+	if (verified.is_flagged && verified.is_flagged.accepted) {
+		(target as Record<string, unknown>)['is_flagged'] = Boolean(verified.is_flagged.value) as unknown;
+	}
+}
+
 type OpenRouterAnalyzerResult = OpenRouterCorporateOutput & {
 	parent_hq_country?: string;
 	category?: string;
@@ -105,6 +348,8 @@ type OpenRouterCorporateOutput = {
 		conflicts_resolved: string;
 		confidence_score: number;
 	};
+	parent_hq_country?: string;
+	category?: string;
 	corporate_hierarchy?: {
 		immediate_owner: string;
 		ultimate_parent: string;
@@ -186,7 +431,7 @@ type CachedProductRow = {
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const OPEN_FOOD_FACTS_API_URL = 'https://world.openfoodfacts.org/api/v2/product';
 const SERPER_API_URL = 'https://google.serper.dev/search';
-const OPENROUTER_MODEL = dynamicEnv.OPENROUTER_MODEL || 'google/gemini-2.0-flash-001';
+const OPENROUTER_MODEL = dynamicEnv.OPENROUTER_MODEL || 'google/gemini-2.5-flash';
 const BROWSER_ACCEPT_HEADER =
 	'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
 const GOOGLE_MOBILE_USER_AGENT =
@@ -199,9 +444,301 @@ const STEALTH_USER_AGENTS = [
 ];
 const STEALTH_ACCEPT_LANGUAGES = ['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'en-US,en;q=0.7'];
 const STEALTH_REFERERS = ['https://www.google.com/', 'https://duckduckgo.com/', 'https://www.bing.com/'];
-// V38 uses a wider stealth jitter window to avoid deterministic timing.
-const JITTER_MIN_MS = 1500;
-const JITTER_MAX_MS = 3000;
+const JITTER_MIN_MS = 200;
+const JITTER_MAX_MS = 600;
+const JITTER_GOOGLE_MIN_MS = 1500;
+const JITTER_GOOGLE_MAX_MS = 2500;
+
+const GS1_PREFIX_MAP: Array<[string | [number, number], string]> = [
+	[[0, 19], 'United States'],
+	[[20, 29], 'United States'],
+	[[30, 39], 'United States'],
+	[[40, 49], 'United States'],
+	[[50, 59], 'United States'],
+	[[60, 139], 'United States'],
+	[[300, 379], 'France'],
+	['380', 'Bulgaria'],
+	['383', 'Slovenia'],
+	['385', 'Croatia'],
+	['387', 'Bosnia and Herzegovina'],
+	['389', 'Montenegro'],
+	[[400, 440], 'Germany'],
+	[[450, 459], 'Japan'],
+	[[460, 469], 'Russia'],
+	['470', 'Kyrgyzstan'],
+	['471', 'Taiwan'],
+	['474', 'Estonia'],
+	['475', 'Latvia'],
+	['476', 'Azerbaijan'],
+	['477', 'Lithuania'],
+	['478', 'Uzbekistan'],
+	['479', 'Sri Lanka'],
+	['480', 'Philippines'],
+	['481', 'Belarus'],
+	['482', 'Ukraine'],
+	['484', 'Moldova'],
+	['485', 'Armenia'],
+	['486', 'Georgia'],
+	['487', 'Kazakhstan'],
+	['488', 'Tajikistan'],
+	['489', 'Hong Kong'],
+	[[490, 499], 'Japan'],
+	[[500, 509], 'United Kingdom'],
+	['520', 'Greece'],
+	['528', 'Lebanon'],
+	['529', 'Cyprus'],
+	['530', 'Albania'],
+	['531', 'North Macedonia'],
+	['535', 'Malta'],
+	['539', 'Ireland'],
+	[[540, 549], 'Belgium'],
+	['560', 'Portugal'],
+	['569', 'Iceland'],
+	[[570, 579], 'Denmark'],
+	['590', 'Poland'],
+	['594', 'Romania'],
+	['599', 'Hungary'],
+	['600', 'South Africa'],
+	['601', 'South Africa'],
+	['603', 'Ghana'],
+	['604', 'Senegal'],
+	['608', 'Bahrain'],
+	['609', 'Mauritius'],
+	['611', 'Morocco'],
+	['613', 'Algeria'],
+	['615', 'Nigeria'],
+	['616', 'Kenya'],
+	['618', 'Ivory Coast'],
+	['619', 'Tunisia'],
+	['620', 'Tanzania'],
+	['621', 'Syria'],
+	['622', 'Egypt'],
+	['624', 'Libya'],
+	['625', 'Jordan'],
+	['626', 'Iran'],
+	['627', 'Kuwait'],
+	['628', 'Saudi Arabia'],
+	['629', 'United Arab Emirates'],
+	[[640, 649], 'Finland'],
+	[[690, 699], 'China'],
+	[[700, 709], 'Norway'],
+	['729', 'Israel'],
+	[[730, 739], 'Sweden'],
+	['740', 'Guatemala'],
+	['741', 'El Salvador'],
+	['742', 'Honduras'],
+	['743', 'Nicaragua'],
+	['744', 'Costa Rica'],
+	['745', 'Panama'],
+	['746', 'Dominican Republic'],
+	['750', 'Mexico'],
+	['754', 'Canada'],
+	['755', 'Canada'],
+	['759', 'Venezuela'],
+	[[760, 769], 'Switzerland'],
+	['770', 'Colombia'],
+	['773', 'Uruguay'],
+	['775', 'Peru'],
+	['777', 'Bolivia'],
+	['778', 'Argentina'],
+	['779', 'Argentina'],
+	['780', 'Chile'],
+	['784', 'Paraguay'],
+	['786', 'Ecuador'],
+	['789', 'Brazil'],
+	['790', 'Brazil'],
+	[[800, 839], 'Italy'],
+	[[840, 849], 'Spain'],
+	['850', 'Cuba'],
+	['858', 'Slovakia'],
+	['859', 'Czech Republic'],
+	['860', 'Serbia'],
+	['865', 'Mongolia'],
+	['867', 'North Korea'],
+	['868', 'Turkey'],
+	['869', 'Turkey'],
+	[[870, 879], 'Netherlands'],
+	['880', 'South Korea'],
+	['883', 'Myanmar'],
+	['884', 'Cambodia'],
+	['885', 'Thailand'],
+	['888', 'Singapore'],
+	['890', 'India'],
+	['893', 'Vietnam'],
+	['896', 'Pakistan'],
+	['899', 'Indonesia'],
+	[[900, 919], 'Austria'],
+	[[930, 939], 'Australia'],
+	[[940, 949], 'New Zealand'],
+	['955', 'Malaysia'],
+	['958', 'Macau']
+];
+
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 30;
+const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+
+function lookupGs1Country(barcode: string): string {
+	const digits = barcode.replace(/\D/g, '');
+	if (digits.length < 3) return 'Unresolved GS1 Country';
+	const prefix3 = Number.parseInt(digits.slice(0, 3), 10);
+	const prefix2 = Number.parseInt(digits.slice(0, 2), 10);
+
+	for (const [key, country] of GS1_PREFIX_MAP) {
+		if (Array.isArray(key)) {
+			const [min, max] = key;
+			if (prefix3 >= min && prefix3 <= max) return country;
+			continue;
+		}
+
+		const numeric = Number.parseInt(key, 10);
+		if (key.length === 3 && prefix3 === numeric) return country;
+		if (key.length === 2 && prefix2 === numeric) return country;
+	}
+
+	return 'Unresolved GS1 Country';
+}
+
+function validateMod10Checksum(digits: string): boolean {
+	if (!/^\d+$/.test(digits) || digits.length < 2) return false;
+	const body = digits.slice(0, -1);
+	const checkDigit = Number.parseInt(digits.slice(-1), 10);
+	let sum = 0;
+	for (let index = body.length - 1, position = 0; index >= 0; index--, position++) {
+		const digit = Number.parseInt(body[index], 10);
+		const multiplier = position % 2 === 0 ? 3 : 1;
+		sum += digit * multiplier;
+	}
+	return (10 - (sum % 10)) % 10 === checkDigit;
+}
+
+function validateBarcode(barcode: string): BarcodeValidation {
+	const digits = barcode.replace(/\D/g, '');
+	const gs1Country = lookupGs1Country(digits);
+
+	if (digits.length === 8) {
+		return { valid: validateMod10Checksum(digits), type: 'EAN-8', digits, gs1Country };
+	}
+
+	if (digits.length === 12) {
+		return { valid: validateMod10Checksum(`0${digits}`), type: 'UPC-A', digits, gs1Country };
+	}
+
+	if (digits.length === 13) {
+		return { valid: validateMod10Checksum(digits), type: 'EAN-13', digits, gs1Country };
+	}
+
+	if (digits.length === 14) {
+		return { valid: validateMod10Checksum(digits), type: 'GTIN-14', digits, gs1Country };
+	}
+
+	return { valid: false, type: 'unknown', digits, gs1Country, error: `Invalid barcode length: ${digits.length}` };
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeoutPromise = new Promise<T>((resolve) => {
+		timer = setTimeout(() => resolve(fallback), ms);
+	});
+
+	try {
+		return await Promise.race([promise, timeoutPromise]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+function checkRateLimit(ip: string): boolean {
+	const now = Date.now();
+	const existing = rateLimitStore.get(ip);
+	if (!existing || now > existing.resetAt) {
+		rateLimitStore.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+		return true;
+	}
+
+	if (existing.count >= RATE_LIMIT_MAX) return false;
+	existing.count += 1;
+	return true;
+}
+
+setInterval(() => {
+	const now = Date.now();
+	for (const [key, entry] of rateLimitStore.entries()) {
+		if (now > entry.resetAt) rateLimitStore.delete(key);
+	}
+}, 300_000);
+
+async function lookupUPCItemDB(barcode: string): Promise<UPCItemDBResult | null> {
+	try {
+		const response = await withTimeout(
+			fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(barcode)}`, {
+				headers: {
+					'Content-Type': 'application/json',
+					'User-Agent': 'isfake-app/1.0'
+				}
+			}),
+			3500,
+			null as Response | null
+		);
+
+		if (!response || !response.ok) return null;
+
+		const data = (await response.json()) as { items?: Array<{ title?: string; brand?: string; category?: string; description?: string }> };
+		const item = data.items?.[0];
+		if (!item) return null;
+
+		return {
+			title: normalizeText(item.title),
+			brand: normalizeText(item.brand),
+			category: normalizeText(item.category),
+			description: normalizeText(item.description)
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function lookupWikipediaBrand(brandName: string): Promise<{ parentCompany: string; country: string; summary: string } | null> {
+	const normalizedBrand = normalizeText(brandName);
+	if (!normalizedBrand || isUnresolved(normalizedBrand)) return null;
+
+	const candidates = buildBrandAliasCandidates(normalizedBrand);
+
+	for (const candidate of candidates.length > 0 ? candidates : [normalizedBrand]) {
+		for (const wikiCandidate of [candidate, `${candidate} company`, `${candidate} brand`, `${candidate} (company)`]) {
+			try {
+				const response = await withTimeout(
+					fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(wikiCandidate)}`, {
+						headers: {
+							'User-Agent': 'isfake-app/1.0'
+						}
+					}),
+					3500,
+					null as Response | null
+				);
+
+				if (!response || !response.ok) continue;
+
+				const data = (await response.json()) as { extract?: string };
+				const summary = normalizeText(data.extract || '');
+				if (!summary) continue;
+
+				const parentMatch = summary.match(/(?:subsidiary of|owned by|division of|part of)\s+([A-Z][A-Za-z0-9&\s,.'-]{2,80})/i);
+				const country = inferCountryFromText(summary);
+
+				return {
+					parentCompany: normalizeText(parentMatch?.[1] || ''),
+					country,
+					summary: summary.slice(0, 300)
+				};
+			} catch {
+				continue;
+			}
+}
+	}
+
+	return null;
+}
 const ALLOWED_ORIGINS = new Set([
 	'https://localhost',
 	'https://localhost:5173',
@@ -326,21 +863,157 @@ function normalizeText(value: unknown) {
 
 function stripGoogleTitleNoise(text: string) {
 	if (!text) return '';
-	return text
-		.split('\n')
-		.map((l) => l.trim())
-		.filter((line) => {
-			if (!line) return false;
-			// Remove explicit Google UI titles or shopping labels
-			if (/google search/i.test(line)) return false;
-			if (/\bgoogle\b/i.test(line) && /\b(shopping|images|maps|news|videos|results?)\b/i.test(line)) return false;
-			if (/ - Google Search$/.test(line) || / - Shopping$/.test(line)) return false;
-			if (/^search results for/i.test(line)) return false;
-			// Titles like "Home - Google Shopping"
-			if (/google shopping/i.test(line)) return false;
-			return true;
-		})
+	return text.replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main content/gi, '');
+}
+
+function normalizeOcrText(text: string) {
+	const cleaned = stripGoogleTitleNoise(normalizeText(text))
+		.replace(/\u00a0/g, ' ')
+		.replace(/[|]/g, ' ')
+		.replace(/[“”]/g, '"')
+		.replace(/[‘’]/g, "'")
+		.replace(/\s+/g, ' ')
+		.trim();
+
+	if (!cleaned) return '';
+
+	return cleaned
+		.split(/\r?\n/)
+		.map((line) => line.replace(/\s+/g, ' ').replace(/\s*([,.;:!?])\s*/g, '$1 ').trim())
+		.filter((line) => line && !/^(?:page \d+|\d+\/\d+|search results|results|ocr text)$/i.test(line))
+		.join('\n')
+		.trim();
+}
+
+function buildBrandAliasCandidates(rawBrand: string) {
+	const normalized = normalizeText(rawBrand);
+	if (!normalized) return [] as string[];
+
+	const candidates = new Set<string>();
+	const add = (value: string) => {
+		const cleaned = normalizeText(value);
+		if (!cleaned || isUnresolved(cleaned)) return;
+		candidates.add(cleaned);
+	};
+
+	add(normalized);
+	add(canonicalizeBrand(normalized));
+	add(deriveBrandFromProductName(normalized));
+	add(normalized.replace(/[™®]/g, '').trim());
+	add(normalized.replace(/\s+(?:the|company|brand)$/i, '').trim());
+	add(normalized.replace(/[^A-Za-z0-9&\s-]/g, ' ').replace(/\s+/g, ' ').trim());
+
+	const tokens = normalized.split(/\s+/).filter(Boolean);
+	if (tokens.length > 1) {
+		add(tokens[0]);
+		add(tokens.slice(0, 2).join(' '));
+	}
+
+	return [...candidates].slice(0, 12);
+}
+
+async function lookupAuthorityRegistryCompany(subject: string): Promise<PublicVerificationResult | null> {
+	const candidates = buildBrandAliasCandidates(subject);
+	if (candidates.length === 0) return null;
+
+	const queries = [
+		...candidates.slice(0, 4).flatMap((candidate) => [
+			`site:find-and-update.company-information.service.gov.uk "${candidate}"`,
+			`site:sec.gov/edgar "${candidate}"`,
+			`site:opencorporates.com/company "${candidate}"`
+		]),
+		...candidates.slice(0, 2).map((candidate) => `${candidate} registered office headquarters`)
+	];
+
+	const results = (await Promise.all(
+		queries.map((query) =>
+			serperSearch(query).catch(() => ({ query, contextText: '', statusCode: 0, used: false, snippetCount: 0 }))
+		)
+		)) as SerperSearchResult[];
+
+	const mergedContext = results
+		.map((result) => result.compactContext || result.contextText || '')
+		.filter(Boolean)
 		.join('\n');
+
+	if (!mergedContext) return null;
+
+	const company = normalizeCompanyName(inferParentFromEvidence(mergedContext, subject) || extractBrandLeadFromMarketContext(mergedContext) || subject);
+	const hqCountry = normalizeCountryCandidate(inferHqCountryFromEvidence(mergedContext, company || subject) || inferCountryFromText(mergedContext));
+	const hasRegistrySignals = /(company number|registered office|incorporated|incorporation|legal entity|registry|companies house|edgar|opencorporates|head office|headquarters)/i.test(
+		mergedContext
+	);
+
+	if (!company || !isStrongCompanyCandidate(company) || !hqCountry || !hasRegistrySignals) return null;
+
+	return {
+		company,
+		hqCountry,
+		website: '',
+		source: 'Registry',
+		score: 0.92,
+		evidence: normalizeText(mergedContext).slice(0, 240)
+	};
+}
+
+async function extractOcrTextFromImageSource(imageSource: string): Promise<string> {
+	const cleanedSource = normalizeText(imageSource).replace(/\s+/g, '');
+	if (!cleanedSource) return '';
+
+	const dataUrl = /^https?:\/\//i.test(cleanedSource) || /^data:/i.test(cleanedSource)
+		? cleanedSource
+		: `data:image/jpeg;base64,${cleanedSource}`;
+
+	const response = await fetch(dataUrl);
+	if (!response.ok) return '';
+
+	const bytes = Buffer.from(await response.arrayBuffer());
+	const { createWorker } = await import('tesseract.js');
+	const worker = await createWorker('eng', 1, {
+		logger: () => undefined
+	});
+
+	try {
+		const result = await worker.recognize(bytes);
+		return normalizeOcrText(result.data.text || '');
+	} finally {
+		await worker.terminate();
+	}
+}
+
+async function resolveCameraEvidence(input: ScanEvidenceInput) {
+	const directText = normalizeOcrText(input.ocr_text || '');
+	if (directText) {
+		return { ocrText: directText, source: 'ocr_text' as const, prompt: '' };
+	}
+
+	const imageSource = normalizeText(input.image_data_url || input.image_base64 || input.image_url || '');
+	if (!imageSource) {
+		return {
+			ocrText: '',
+			source: null,
+			prompt: 'Point the camera at the product label so OCR can read the package text.'
+		};
+	}
+
+	if (imageSource.length > 6_000_000) {
+		return {
+			ocrText: '',
+			source: null,
+			prompt: 'Image is too large for OCR. Move the camera closer and retry with a tighter crop.'
+		};
+	}
+
+	const ocrText = await withTimeout(extractOcrTextFromImageSource(imageSource).catch(() => ''), 8000, '');
+	if (!ocrText) {
+		return {
+			ocrText: '',
+			source: 'image' as const,
+			prompt: 'OCR could not read the label. Point the camera closer to the product and retry.'
+		};
+	}
+
+	return { ocrText, source: 'image' as const, prompt: '' };
 }
 
 function isValidBrandCandidate(candidate: string) {
@@ -520,9 +1193,13 @@ function normalizeCompanyName(raw?: string) {
 	// Remove article-like noise or very long sluggy strings
 	if (/^(https?:\/\/|www\.|cdn\.)/i.test(s)) return '';
 	if (s.length > 120) return '';
+	if (inferCountryFromText(s) && normalizeText(s).toLowerCase() === inferCountryFromText(s).toLowerCase()) return '';
 
 	// Simple blacklist for noisy patterns
-	if (/\b(cnn|the following|list of products|shopping|results|google)\b/i.test(s)) return '';
+	const hasCorporateSuffix = /\b(inc|ltd|limited|llc|plc|corp|corporation|company|group|spa|s\.a\.|gmbh|nv|holdings|industries|international)\b/i.test(s);
+	if (/\b(cnn|the following|list of products|shopping|results|google|where an item was manufactured|number tells you)\b/i.test(s)) return '';
+	if (/\b(by the|official site|product page|barcode|search results)\b/i.test(s)) return '';
+	if (/\b(drink|biscuits|dates|chocolate|cereal|cookie|soda|juice|water|snack|food)\b/i.test(s) && !hasCorporateSuffix) return '';
 
 	// Title-case for readability
 	try {
@@ -530,6 +1207,98 @@ function normalizeCompanyName(raw?: string) {
 	} catch {
 		return s;
 	}
+}
+
+function buildOfficialSiteCandidates(subject: string, websiteHint?: string, wikidataWebsite?: string) {
+	const candidates = new Set<string>();
+	const addWebsite = (value: string) => {
+		const cleaned = normalizeText(value);
+		if (!cleaned) return;
+		const normalized = /^https?:\/\//i.test(cleaned) ? cleaned : `https://${cleaned.replace(/^\/+/, '')}`;
+		candidates.add(normalized.replace(/\/$/, ''));
+	};
+
+	const addDomain = (domain: string) => {
+		const cleaned = normalizeText(domain).toLowerCase().replace(/[^a-z0-9.-]/g, '');
+		if (!cleaned) return;
+		addWebsite(cleaned);
+		if (!cleaned.startsWith('www.')) {
+			addWebsite(`www.${cleaned}`);
+		}
+	};
+
+	addWebsite(websiteHint || '');
+	addWebsite(wikidataWebsite || '');
+
+	const company = normalizeCompanyName(subject);
+	if (!company) return [...candidates];
+
+	const suffixStopWords = new Set([
+		'group',
+		'holding',
+		'holdings',
+		'company',
+		'co',
+		'corp',
+		'corporation',
+		'limited',
+		'ltd',
+		'inc',
+		'international',
+		'industries',
+		'manufacturing',
+		'food',
+		'foods',
+		'beverage',
+		'beverages',
+		'packaging',
+		'enterprises'
+	]);
+	const noiseWords = new Set(['the', 'and', 'of', 'for', 'a', 'an', 'in']);
+	const tokens = company
+		.toLowerCase()
+		.split(/\s+/)
+		.filter((token) => token && !noiseWords.has(token));
+	const rootTokens = tokens.filter((token) => !suffixStopWords.has(token));
+	const bases = [
+		rootTokens[0] || '',
+		rootTokens.join(''),
+		tokens[0] || '',
+		company.toLowerCase().replace(/\s+/g, '')
+	].filter((value, index, all) => value && all.indexOf(value) === index);
+
+	for (const base of bases) {
+		const compact = base.replace(/[^a-z0-9]/g, '');
+		if (!compact) continue;
+		const tlds = ['com', 'net', 'org', 'co', 'biz', 'info', 'io', 'bd', 'com.bd', 'net.bd', 'co.bd', 'com.au', 'co.uk', 'uk'];
+		for (const tld of tlds) {
+			addDomain(`${compact}.${tld}`);
+		}
+		addDomain(`${compact}group.com`);
+		addDomain(`${compact}group.net`);
+		addDomain(`${compact}group.com.bd`);
+		// also try hyphenated variants: e.g., akij-group
+		addDomain(`${compact}-group.com`);
+		addDomain(`${compact}-group.net`);
+	}
+
+	return [...candidates];
+}
+
+function isGenericBarcodeCountryNoise(text: string) {
+	const normalized = normalizeText(text).toLowerCase();
+	if (!normalized) return false;
+	return /\b(barcode country code|country code table|country prefix|gs1|gtin|ean country code|upc barcode guide|barcode lookup|verified by gs1|barcode us|countrychecker|barcode country codes|how to identify a product's origin from its barcode)\b/i.test(normalized);
+}
+
+function isStrongCompanyCandidate(candidate: string) {
+	const normalized = normalizeCompanyName(candidate);
+	if (!normalized) return false;
+	if (isUnresolved(normalized)) return false;
+	if (inferCountryFromText(normalized)) return false;
+	const lower = normalized.toLowerCase();
+	if (/\b(cnn|google search|shopping|results?|the following|barcode lookup|country code|country prefix)\b/i.test(lower)) return false;
+	return /\b(company|co\.?|group|holdings?|limited|ltd|inc|llc|plc|corp|corporation|sa|s\.a\.|gmbh|nv|spa|industries|international|beverage|beverages|foods?|enterprises|manufacturing|packaging)\b/i.test(lower);
 }
 
 function extractBrandLeadFromMarketContext(contextText: string) {
@@ -541,7 +1310,10 @@ function extractBrandLeadFromMarketContext(contextText: string) {
 		.filter(Boolean);
 	for (const line of lines) {
 		const title = line.match(/^\[\d+\]\s*([^:|]{2,80})/)?.[1];
-		const candidate = normalizeText(title || line.split('::')[0]);
+		const candidate = normalizeText(title || line.split('::')[0])
+			.replace(/\s*\([^)]*\)/g, '')
+			.replace(/\s*[-|].*$/, '')
+			.trim();
 		if (!isValidBrandCandidate(candidate)) continue;
 		if (!candidate) continue;
 		if (/^https?:\/\//i.test(candidate)) continue;
@@ -551,57 +1323,343 @@ function extractBrandLeadFromMarketContext(contextText: string) {
 	return '';
 }
 
-function inferParentFromEvidence(contextText: string) {
+function inferParentFromEvidence(contextText: string, brandHint?: string) {
 	const normalized = normalizeText(contextText);
+	const brandToken = normalizeText(brandHint || '').toLowerCase();
+	const lines = normalized
+		.split('\n')
+		.map((line) => normalizeText(line))
+		.filter(Boolean);
+	const candidateLines = brandToken
+		? lines.filter((line) => line.toLowerCase().includes(brandToken))
+		: lines;
+	const searchSpace = candidateLines.length > 0 ? candidateLines.join('\n') : normalized;
 	const patterns = [
 		/^([A-Z][A-Za-z0-9&.,'-]{1,50}(?:\s+[A-Z][A-Za-z0-9&.,'-]{1,50}){0,4})\s+(?:is|was|are|were|has|have|buying|launching|announces|introduces|creates|makes|made|produces|acquires|purchases|develops)\b/i,
-		/(?:parent company|owned by|acquired by|manufacturer is)\s+([A-Z][A-Za-z0-9&.,'-\s]{2,80})/i,
+		/(?:parent company|owned by|acquired by|manufacturer is|manufactured by|produced by|made by|imported by|distributed by|licensed by|packed by|packed for|manufactured for|distributed for)\s+([A-Z][A-Za-z0-9&.,'-\s]{2,80})/i,
 		/([A-Z][A-Za-z0-9&.,'-\s]{2,80})\s+(?:owns|acquired|is the parent company of)/i
 	];
 	for (const pattern of patterns) {
-		const match = normalized.match(pattern);
+		const match = searchSpace.match(pattern);
 		const value = normalizeText(match?.[1]);
-		if (value && !/unresolved|unknown|n\/a/i.test(value)) {
+		if (value && !/unresolved|unknown|n\/a/i.test(value) && isStrongCompanyCandidate(value)) {
 			return value.replace(/[.;,:]$/, '');
 		}
 	}
 	return '';
 }
 
-function inferOriginCountryFromEvidence(contextText: string) {
+function companyValueHasEvidenceSupport(value: string, contextText: string, anchor?: string) {
+	const normalizedValue = normalizeCompanyName(value);
+	if (!normalizedValue || isUnresolved(normalizedValue) || !isStrongCompanyCandidate(normalizedValue)) return false;
+
+	const anchorText = normalizeText(anchor || '');
+	const lines = splitEvidenceLines(contextText);
+	for (const line of lines) {
+		const lower = line.toLowerCase();
+		if (!lower.includes(normalizedValue.toLowerCase())) continue;
+		if (anchorText && lineMentionsAnchor(line, anchorText)) return true;
+		if (/(owned by|parent company|manufacturer is|manufactured by|acquired by|produced by|made by|imported by|distributed by|licensed by|packed by|packed for|manufactured for|distributed for|company|group|holding|headquarters|\bhq\b|brand|owner)/i.test(line)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+function companyHasHqEvidence(value: string, contextText: string, anchor?: string) {
+	const normalizedValue = normalizeCompanyName(value);
+	if (!normalizedValue || isUnresolved(normalizedValue)) return false;
+	const anchorText = normalizeText(anchor || '');
+	const lines = splitEvidenceLines(contextText);
+	for (const line of lines) {
+		const lower = line.toLowerCase();
+		if (!lower.includes(normalizedValue.toLowerCase())) continue;
+		// Require explicit HQ language together with the company mention (stronger signal)
+		if (/(headquarters|head office|headquartered|registered office|global hq|corporate headquarters|\bhq\b|based in|located in)/i.test(line)) {
+			if (anchorText) {
+				if (lineMentionsAnchor(line, anchorText)) return true;
+			} else {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+function inferOriginCountryFromEvidence(contextText: string, anchor?: string) {
+	return resolveCountryFromEvidence(contextText, anchor, 'origin');
+}
+
+function normalizeCountryCandidate(value?: string | null) {
+	return inferCountryFromText(value || '');
+}
+
+function looksLikeProductLabel(value: string) {
+	const text = normalizeText(value).toLowerCase();
+	if (!text) return false;
+	return /\b(drink|biscuits|dates|chocolate|cereal|cookie|soda|juice|water|snack|food|taste|original)\b/i.test(text);
+}
+
+function deriveBrandFromProductName(productName: string) {
+	const cleaned = normalizeText(productName)
+		.replace(/\s*\([^)]*\)/g, '')
+		.replace(/\s*[-|].*$/, '')
+		.trim();
+	if (!cleaned) return '';
+	const firstToken = cleaned.split(/\s+/)[0] || '';
+	if (!firstToken) return '';
+	if (!/^[A-Z][A-Za-z0-9&'-]{1,30}$/.test(firstToken)) return '';
+	if (looksLikeProductLabel(firstToken)) return '';
+	if (/^(barcode|lookup|wikipedia|wikidata|google|official|search)$/i.test(firstToken)) return '';
+	return firstToken;
+}
+
+function lineMentionsAnchor(line: string, anchor: string) {
+	const normalizedAnchor = normalizeText(anchor).toLowerCase();
+	if (!normalizedAnchor) return false;
+	const anchorTokens = normalizedAnchor.split(/\s+/).filter((token) => token.length > 2);
+	if (anchorTokens.length === 0) return false;
+	const normalizedLine = normalizeText(line).toLowerCase();
+	return anchorTokens.some((token) => normalizedLine.includes(token));
+}
+
+function splitEvidenceLines(contextText: string) {
+	return normalizeText(contextText)
+		.split('\n')
+		.map((line) => normalizeText(line))
+		.filter((line) => line && !isGenericBarcodeCountryNoise(line));
+}
+
+function resolveCountryFromEvidence(contextText: string, anchor?: string, mode: 'origin' | 'hq' = 'origin') {
 	const normalized = normalizeText(contextText);
 	if (!normalized) return '';
 
-	const patterns = [
-		/(?:made|produced|manufactured|packed|origin|country of origin|product of)\s+(?:in\s+)?([A-Z][A-Za-z\s-]{2,50})/i,
-		/\b(Italy|France|Germany|United States|USA|U\.S\.A\.|UK|United Kingdom|Spain|Netherlands|Belgium|Switzerland|Denmark|Sweden|Norway|Finland|Poland|Austria|Ireland|Canada|Mexico|Brazil|Japan|China|India|Australia|New Zealand)\b/i
-	];
+	const anchorText = normalizeText(anchor || '');
+	const lines = splitEvidenceLines(normalized);
+	let bestCountry = '';
+	let bestScore = 0;
+	const minimumScore = mode === 'hq' ? 5 : 3;
 
-	for (const pattern of patterns) {
-		const match = normalized.match(pattern);
-		const value = normalizeText(match?.[1]);
-		if (value && !/unresolved|unknown|n\/a/i.test(value)) return value.replace(/[.;,:]$/, '');
-	}
+	for (const line of lines) {
+		const country = inferCountryFromText(line);
+		if (!country) continue;
 
-	return '';
-}
+		const lower = line.toLowerCase();
+		let score = 0;
 
-function inferHqCountryFromEvidence(contextText: string) {
-	const normalized = normalizeText(contextText);
-	const directCountry = inferCountryFromText(normalized);
-	if (directCountry) return directCountry;
-	const patterns = [
-		/(?:global headquarters|headquarters|hq)\s+(?:is|are|in|located in)\s+([A-Z][A-Za-z\s-]{2,50})/i,
-		/([A-Z][A-Za-z\s-]{2,50})\s*(?:is home to|hosts)\s*(?:the )?(?:global )?headquarters/i
-	];
-	for (const pattern of patterns) {
-		const match = normalized.match(pattern);
-		const value = inferCountryFromText(match?.[1] || '');
-		if (value) {
-			return value;
+		if (mode === 'origin') {
+			if (/(country of origin|origin|made in|product of|manufactured in|produced in|packed in)/i.test(lower)) score += 5;
+			if (/(manufactured by|produced by|made by)/i.test(lower)) score += 2;
+		} else {
+			if (/(headquarters|head office|headquartered|global hq|corporate headquarters|\bhq\b)/i.test(lower)) score += 5;
+			if (/(based in|located in)/i.test(lower)) score += 2;
+		}
+
+		if (anchorText && lineMentionsAnchor(line, anchorText)) score += 3;
+		if (lines.length <= 3) score += 1;
+		if (line.split(/\s+/).length <= 12) score += 1;
+
+		if (score < minimumScore) continue;
+		if (score > bestScore) {
+			bestScore = score;
+			bestCountry = country;
 		}
 	}
-	return '';
+
+	return bestCountry;
+}
+
+function inferHqCountryFromEvidence(contextText: string, anchor?: string) {
+	return resolveCountryFromEvidence(contextText, anchor, 'hq');
+}
+
+async function runSupplementalCorporateSearch(subject: string, barcode: string) {
+	const cleanedSubject = normalizeText(subject);
+	if (!cleanedSubject || isUnresolved(cleanedSubject)) {
+		return { contextText: '', queries: [] as string[] };
+	}
+
+	const queries = [
+		`${cleanedSubject} manufacturer company`,
+		`${cleanedSubject} parent company headquarters`,
+		`${cleanedSubject} country of origin`,
+		`${cleanedSubject} made in`
+	];
+	console.log(`🔎 [SUPPLEMENTAL_SEARCH] barcode=${barcode} subject=${cleanedSubject}`);
+
+	const results = (await Promise.all(
+		queries.map((query) =>
+			serperSearch(query).catch(() => ({ query, contextText: '', statusCode: 0, used: false, snippetCount: 0 }))
+		)
+	)) as SerperSearchResult[];
+
+	const mergedContext = results.map((result) => result.compactContext || result.contextText || '').filter(Boolean).join('\n');
+	if (mergedContext) {
+		console.log(`📡 [SUPPLEMENTAL_SEARCH] snippets=${results.reduce((sum, result) => sum + (result.snippetCount || 0), 0)}`);
+	}
+
+	return { contextText: mergedContext, queries };
+}
+
+async function lookupWikidataCompany(subject: string): Promise<PublicVerificationResult | null> {
+	const cleanedSubject = normalizeText(subject);
+	if (!cleanedSubject || isUnresolved(cleanedSubject)) return null;
+
+	const query = `
+SELECT ?item ?itemLabel ?website ?countryLabel ?hqLabel WHERE {
+  VALUES ?searchTerm { "${cleanedSubject.replace(/"/g, '\\"')}" }
+  SERVICE wikibase:mwapi {
+    bd:serviceParam wikibase:api "EntitySearch".
+    bd:serviceParam wikibase:endpoint "www.wikidata.org".
+    bd:serviceParam mwapi:search ?searchTerm.
+    bd:serviceParam mwapi:language "en".
+    ?item wikibase:apiOutputItem mwapi:item.
+  }
+  OPTIONAL { ?item wdt:P856 ?website. }
+  OPTIONAL { ?item wdt:P17 ?country. }
+  OPTIONAL { ?item wdt:P159 ?hq. }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+}
+LIMIT 1`.trim();
+
+	try {
+		const response = await fetch('https://query.wikidata.org/sparql?format=json&query=' + encodeURIComponent(query), {
+			headers: buildFetchHeaders({ Accept: 'application/sparql-results+json' })
+		});
+		if (!response.ok) return null;
+		const payload = (await response.json()) as {
+			results?: {
+				bindings?: Array<{
+					itemLabel?: { value?: string };
+					website?: { value?: string };
+					countryLabel?: { value?: string };
+					hqLabel?: { value?: string };
+				}>;
+			};
+		};
+		const binding = payload.results?.bindings?.[0];
+		if (!binding) return null;
+		const company = normalizeCompanyName(binding.itemLabel?.value || '') || '';
+		const website = normalizeText(binding.website?.value || '');
+		const hqCountry = inferCountryFromText(binding.hqLabel?.value || binding.countryLabel?.value || '');
+		if (!company || !isStrongCompanyCandidate(company)) return null;
+		const score = hqCountry ? 0.9 : 0.75;
+		return {
+			company,
+			hqCountry: hqCountry || 'Unresolved HQ Country',
+			website,
+			source: 'Wikidata',
+			score,
+			evidence: `Wikidata company=${company} website=${website || 'n/a'} hq=${hqCountry || 'n/a'}`
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function probeOfficialSite(websiteUrl: string, anchor?: string): Promise<PublicVerificationResult | null> {
+	const cleanedUrl = normalizeText(websiteUrl);
+	if (!cleanedUrl || !/^https?:\/\//i.test(cleanedUrl)) return null;
+
+	const candidates = [cleanedUrl, `${cleanedUrl.replace(/\/$/, '')}/about`, `${cleanedUrl.replace(/\/$/, '')}/contact`];
+	for (const candidate of candidates) {
+		try {
+			let response: Response | null = null;
+			try {
+				response = await fetch(candidate, { headers: buildFetchHeaders(), redirect: 'follow' });
+				if (!response.ok) {
+					// Try http fallback for sites that don't like https
+					if (/^https:\/\//i.test(candidate)) {
+						const httpCandidate = candidate.replace(/^https:/i, 'http:');
+						try {
+							response = await fetch(httpCandidate, { headers: buildFetchHeaders(), redirect: 'follow' });
+						} catch {
+							response = null;
+						}
+						if (!response || !response.ok) continue;
+					} else continue;
+				}
+			} catch {
+				// Try http variant if https failed with network error
+				if (/^https:\/\//i.test(candidate)) {
+					const httpCandidate = candidate.replace(/^https:/i, 'http:');
+					try {
+						response = await fetch(httpCandidate, { headers: buildFetchHeaders(), redirect: 'follow' });
+					} catch {
+						response = null;
+					}
+				}
+				if (!response) continue;
+			}
+			const html = await response.text();
+			const $ = cheerio.load(html);
+			const ldJson = $('script[type="application/ld+json"]')
+				.map((_, element) => normalizeText($(element).text()))
+				.get()
+				.join('\n');
+			const pageText = normalizeText([
+				$('title').text(),
+				$('meta[name="description"]').attr('content') || '',
+				$('body').text(),
+				ldJson
+			].join('\n'));
+			const company = normalizeCompanyName(
+				$('meta[property="og:site_name"]').attr('content') || $('title').text() || anchor || cleanedUrl
+			);
+			const hqCountry = inferHqCountryFromEvidence(pageText, anchor || company) || inferCountryFromText(pageText);
+			if (!company || !isStrongCompanyCandidate(company)) continue;
+			if (!hqCountry) continue;
+			return {
+				company,
+				hqCountry,
+				website: candidate,
+				source: 'OfficialSite',
+				score: 0.8,
+				evidence: normalizeText(pageText).slice(0, 240)
+			};
+		} catch {
+			continue;
+		}
+	}
+
+	return null;
+}
+
+async function runPublicVerificationPass(subject: string, websiteHint?: string) {
+	const wikidata = await lookupWikidataCompany(subject);
+	if (wikidata) {
+		console.log(`🛰️ [PUBLIC_VERIFY] Wikidata company=${wikidata.company} hq=${wikidata.hqCountry}`);
+		if (!isUnresolved(wikidata.hqCountry) && !isUnresolved(wikidata.company)) return wikidata;
+	}
+
+	const registry = await lookupAuthorityRegistryCompany(subject);
+	if (registry) {
+		console.log(`🏛️ [PUBLIC_VERIFY] Registry company=${registry.company} hq=${registry.hqCountry}`);
+		if (!isUnresolved(registry.hqCountry) && !isUnresolved(registry.company)) return registry;
+	}
+
+	const website = normalizeText(websiteHint || wikidata?.website || '');
+	if (website) {
+		const official = await probeOfficialSite(website, subject);
+		if (official) {
+			console.log(`🔎 [PUBLIC_VERIFY] OfficialSite company=${official.company} hq=${official.hqCountry}`);
+			return official;
+		}
+	}
+
+	const guessedCandidates = buildOfficialSiteCandidates(subject, website, wikidata?.website || '');
+	for (const candidate of guessedCandidates) {
+		if (!candidate || candidate === website) continue;
+		console.log(`🔎 [PUBLIC_VERIFY] Guessing official site candidate=${candidate}`);
+		const official = await probeOfficialSite(candidate, subject);
+		if (official) {
+			console.log(`🔎 [PUBLIC_VERIFY] OfficialSite guess hit company=${official.company} hq=${official.hqCountry}`);
+			return official;
+		}
+	}
+
+	return registry || wikidata;
 }
 
 function pickEvidenceSnippet(contextText: string, token?: string) {
@@ -643,14 +1701,6 @@ function extractProductIdentityFromEvidence(merged: string, market: string, deep
 		const pick = normalizeText(candidate || productPattern[0]);
 		// Avoid single-token generic picks
 		if (pick && pick.split(/\s+/).length > 1) result.productName = pick;
-	}
-
-	// If explicit SodaStream token appears, capture a nearby phrase
-	const sodaHit = text.match(/(SodaStream(?:\s+[A-Za-z0-9-]{1,20}){0,5})/i);
-	if (sodaHit) {
-		result.productName = normalizeText(sodaHit[1]);
-		result.brand = result.brand || 'SodaStream';
-		result.sourceLine = sodaHit[1];
 	}
 
 	return result;
@@ -749,6 +1799,48 @@ function buildSourceHierarchy(args: {
 	if (args.offAvailable) layers.push('Registry OFF');
 	if (args.internalFallback) layers.push('Internal Fallback');
 	return layers.length > 0 ? layers.join(' > ') : 'Internal Fallback';
+}
+
+function buildEvidenceBundle(args: {
+	barcode: string;
+	offProduct: OpenFoodFactsProduct | null;
+	offBrand: string;
+	offOriginCountry: string;
+	offCategory: string;
+	offParentCompany: string;
+	publicVerification: PublicVerificationResult | null;
+	searchContext: string;
+	deepScrape: string;
+	hqPulse: string;
+	truthBundleBlock: string;
+}): EvidenceBundle {
+	const productName =
+		normalizeText(args.offProduct?.product_name) ||
+		extractProductIdentityFromEvidence(
+			[args.searchContext, args.deepScrape, args.truthBundleBlock, args.hqPulse].filter(Boolean).join('\n'),
+			args.searchContext,
+			args.deepScrape,
+			args.truthBundleBlock
+		).productName ||
+		`Unresolved Product ${args.barcode}`;
+	const sources = [
+		args.offProduct ? 'OFF' : '',
+		args.publicVerification?.source ? `Public:${args.publicVerification.source}` : '',
+		args.searchContext ? 'Serper' : '',
+		args.deepScrape ? 'Scraper' : '',
+		args.hqPulse ? 'HQ-Query' : ''
+	].filter(Boolean);
+
+	return {
+		product_name: productName,
+		brand: normalizeText(args.offBrand) || 'Unresolved Brand',
+		parent_company: normalizeText(args.offParentCompany || args.publicVerification?.company || '') || 'Unresolved Parent',
+		parent_hq_country:
+			normalizeText(args.publicVerification?.hqCountry || '') || 'Unresolved HQ Country',
+		origin_country: normalizeText(args.offOriginCountry) || 'Unresolved Origin',
+		category: normalizeText(args.offCategory) || 'Unresolved Category',
+		sources
+	};
 }
 
 function buildScrapeHeaders() {
@@ -1022,6 +2114,8 @@ function extractOffCategory(product: OpenFoodFactsProduct | null) {
 
 function extractOffParentCompany(product: OpenFoodFactsProduct | null) {
 	if (!product) return '';
+	const productName = normalizeText(product.product_name);
+	const productFirstToken = normalizeText(productName.split(/\s+/)[0] || '').toLowerCase();
 
 	const candidates = [
 		product.owner_name,
@@ -1036,6 +2130,10 @@ function extractOffParentCompany(product: OpenFoodFactsProduct | null) {
 		const cleaned = regexCleaner(normalizeText(candidate));
 		if (!cleaned || isUnresolved(cleaned)) continue;
 		if (cleaned.length < 2 || cleaned.length > 120) continue;
+		const cleanedLower = cleaned.toLowerCase();
+		const hasCorporateSignal = /\b(company|group|holdings?|limited|ltd|inc|llc|plc|corp|corporation|sa|s\.a\.|gmbh|nv|spa|industries|international|beverage|beverages|foods?|enterprises|manufacturing|packaging)\b/i.test(cleanedLower);
+		if (productFirstToken && cleanedLower === productFirstToken && !hasCorporateSignal) continue;
+		if (productName && cleanedLower === productName.toLowerCase() && !hasCorporateSignal) continue;
 		const normalized = normalizeCompanyName(cleaned);
 		if (!normalized) continue;
 		return normalized;
@@ -1052,6 +2150,7 @@ function inferCountryFromText(text: string) {
 		[/\bUnited States\b/i, 'United States'],
 		[/\bU\.S\.A\.??\b/i, 'United States'],
 		[/\bUSA\b/i, 'United States'],
+		[/\bU\.S\.?\b/i, 'United States'],
 		[/\bUnited Kingdom\b/i, 'United Kingdom'],
 		[/\bU\.K\.\b/i, 'United Kingdom'],
 		[/\bUK\b/i, 'United Kingdom'],
@@ -1076,8 +2175,88 @@ function inferCountryFromText(text: string) {
 		[/\bJapan\b/i, 'Japan'],
 		[/\bChina\b/i, 'China'],
 		[/\bIndia\b/i, 'India'],
+		[/\bBangladesh\b/i, 'Bangladesh'],
+		[/\bSaudi Arabia\b/i, 'Saudi Arabia'],
+		[/\bKSA\b/i, 'Saudi Arabia'],
+		[/\bUAE\b/i, 'United Arab Emirates'],
+		[/\bUnited Arab Emirates\b/i, 'United Arab Emirates'],
+		[/\bSouth Korea\b/i, 'South Korea'],
+		[/\bRepublic of Korea\b/i, 'South Korea'],
+		[/\bNorth Korea\b/i, 'North Korea'],
+		[/\bCzech Republic\b/i, 'Czech Republic'],
+		[/\bCzechia\b/i, 'Czech Republic'],
+		[/\bTürkiye\b/i, 'Turkey'],
+		[/\bTurkey\b/i, 'Turkey'],
+		[/\bTaiwan\b/i, 'Taiwan'],
+		[/\bHong Kong\b/i, 'Hong Kong'],
+		[/\bSingapore\b/i, 'Singapore'],
+		[/\bMalaysia\b/i, 'Malaysia'],
+		[/\bThailand\b/i, 'Thailand'],
+		[/\bPhilippines\b/i, 'Philippines'],
+		[/\bIndonesia\b/i, 'Indonesia'],
+		[/\bVietnam\b/i, 'Vietnam'],
+		[/\bEgypt\b/i, 'Egypt'],
+		[/\bSouth Africa\b/i, 'South Africa'],
+		[/\bMorocco\b/i, 'Morocco'],
+		[/\bNigeria\b/i, 'Nigeria'],
+		[/\bKenya\b/i, 'Kenya'],
+		[/\bArgentina\b/i, 'Argentina'],
+		[/\bChile\b/i, 'Chile'],
+		[/\bColombia\b/i, 'Colombia'],
+		[/\bPeru\b/i, 'Peru'],
+		[/\bTurkey\b/i, 'Turkey'],
+		[/\bPakistan\b/i, 'Pakistan'],
+		[/\bSri Lanka\b/i, 'Sri Lanka'],
 		[/\bAustralia\b/i, 'Australia'],
-		[/\bNew Zealand\b/i, 'New Zealand']
+		[/\bNew Zealand\b/i, 'New Zealand'],
+		[/\bIsrael\b/i, 'Israel'],
+		[/\bPortugal\b/i, 'Portugal'],
+		[/\bGreece\b/i, 'Greece'],
+		[/\bRomania\b/i, 'Romania'],
+		[/\bHungary\b/i, 'Hungary'],
+		[/\bCroatia\b/i, 'Croatia'],
+		[/\bSlovakia\b/i, 'Slovakia'],
+		[/\bBulgaria\b/i, 'Bulgaria'],
+		[/\bSerbia\b/i, 'Serbia'],
+		[/\bUkraine\b/i, 'Ukraine'],
+		[/\bRussia\b/i, 'Russia'],
+		[/\bKazakhstan\b/i, 'Kazakhstan'],
+		[/\bIran\b/i, 'Iran'],
+		[/\bIraq\b/i, 'Iraq'],
+		[/\bJordan\b/i, 'Jordan'],
+		[/\bLebanon\b/i, 'Lebanon'],
+		[/\bQatar\b/i, 'Qatar'],
+		[/\bKuwait\b/i, 'Kuwait'],
+		[/\bOman\b/i, 'Oman'],
+		[/\bBahrain\b/i, 'Bahrain'],
+		[/\bDubai\b/i, 'United Arab Emirates'],
+		[/\bAbu Dhabi\b/i, 'United Arab Emirates'],
+		[/\bSharjah\b/i, 'United Arab Emirates'],
+		[/\bRiyadh\b/i, 'Saudi Arabia'],
+		[/\bJeddah\b/i, 'Saudi Arabia'],
+		[/\bDoha\b/i, 'Qatar'],
+		[/\bKuwait City\b/i, 'Kuwait'],
+		[/\bEthiopia\b/i, 'Ethiopia'],
+		[/\bGhana\b/i, 'Ghana'],
+		[/\bTanzania\b/i, 'Tanzania'],
+		[/\bZimbabwe\b/i, 'Zimbabwe'],
+		[/\bMaldives\b/i, 'Maldives'],
+		[/\bNepal\b/i, 'Nepal'],
+		[/\bMyanmar\b/i, 'Myanmar'],
+		[/\bCambodia\b/i, 'Cambodia'],
+		[/\bLaos\b/i, 'Laos'],
+		[/\bEcuador\b/i, 'Ecuador'],
+		[/\bUruguay\b/i, 'Uruguay'],
+		[/\bParaguay\b/i, 'Paraguay'],
+		[/\bBolivia\b/i, 'Bolivia'],
+		[/\bVenezuela\b/i, 'Venezuela'],
+		[/\bPanama\b/i, 'Panama'],
+		[/\bGuatemala\b/i, 'Guatemala'],
+		[/\bCosta Rica\b/i, 'Costa Rica'],
+		[/\bCuba\b/i, 'Cuba'],
+		[/\bDominican Republic\b/i, 'Dominican Republic'],
+		[/\bJamaica\b/i, 'Jamaica'],
+		[/\bTrinidad\b/i, 'Trinidad and Tobago']
 	];
 
 	for (const [pattern, canonical] of aliases) {
@@ -1114,7 +2293,8 @@ async function lookupOpenFoodFactsProduct(barcode: string) {
 }
 
 async function semanticGoogleScrape(barcode: string) {
-	await applyJitterDelay();
+	const googleDelayMs = JITTER_GOOGLE_MIN_MS + Math.floor(Math.random() * (JITTER_GOOGLE_MAX_MS - JITTER_GOOGLE_MIN_MS + 1));
+	await new Promise((resolve) => setTimeout(resolve, googleDelayMs));
 
 	const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(`barcode ${barcode}`)}&hl=en&gl=us&num=10&pws=0`;
 	const response = await fetch(searchUrl, {
@@ -1258,7 +2438,7 @@ function fallbackCorporateResult(barcode: string): OpenRouterCorporateOutput {
 	};
 }
 
-async function callOpenRouterAnalyzer(args: {
+function buildEvidenceDrivenFallback(args: {
 	barcode: string;
 	registryData: string;
 	marketPulse: string;
@@ -1274,9 +2454,176 @@ async function callOpenRouterAnalyzer(args: {
 	arbitrationPath: string;
 	offProduct: OpenFoodFactsProduct | null;
 	sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'>;
+}, reason: string): OpenRouterAnalyzerResult {
+	const prefix = getGs1RegistrationPrefix(args.barcode);
+	const offProductName = normalizeText(args.offProduct?.product_name) || `Unresolved Product ${args.barcode}`;
+	const offBrandParsed = parseOffBrandDeep(args.offProduct);
+	const offBrand = offBrandParsed.brand || normalizeText(args.offProduct?.brand_owner) || normalizeText(args.offProduct?.manufacturer_name) || '';
+	const offParent = extractOffParentCompany(args.offProduct);
+	const offOrigin = extractOffOriginCountry(args.offProduct);
+	const offCategory = extractOffCategory(args.offProduct);
+	const marketAndScrape = `${args.marketPulse}\n${args.deepScrape}\n${args.searchContext}\n${args.truthBundleBlock}\n${args.hqPulse || ''}`;
+	const productName =
+		offProductName ||
+		extractProductIdentityFromEvidence(marketAndScrape, args.searchContext, args.deepScrape, args.registryData).productName ||
+		`Unresolved Product ${args.barcode}`;
+	const evidenceBrand =
+		normalizeText(offBrand || deriveBrandFromProductName(productName) || extractBrandLeadFromMarketContext(marketAndScrape) || '') ||
+		'Unresolved Brand';
+	const evidenceParent =
+		normalizeCompanyName(
+			offParent ||
+				inferParentFromEvidence(marketAndScrape, evidenceBrand) ||
+				inferParentFromEvidence(args.offData || marketAndScrape, evidenceBrand) ||
+				''
+		) || 'Unresolved Parent';
+	const evidenceOrigin =
+		normalizeCountryCandidate(offOrigin || inferOriginCountryFromEvidence(marketAndScrape) || args.hqPulse || '') || 'Unresolved Origin';
+	const evidenceHq =
+		normalizeCountryCandidate(inferHqCountryFromEvidence(marketAndScrape) || evidenceOrigin || '') || 'Unresolved HQ Country';
+	const evidenceCategory =
+		!isUnresolved(offCategory)
+			? offCategory
+			: domainToCategory(detectLikelyDomain(`${args.offData}\n${marketAndScrape}`));
+	const confidence = evidenceBrand.startsWith('Unresolved') || evidenceParent.startsWith('Unresolved') ? 0.5 : 0.8;
+	const sourceAttribution = args.sourcesUsed.includes('Search_Scrape')
+		? 'Search_Scrape'
+		: args.sourcesUsed.includes('OFF_API')
+			? 'OFF_API'
+			: 'Internal_Knowledge';
+	const sourcesSynced = toVerificationSources(args.sourcesUsed);
+	const auditParent = pickEvidenceSnippet(marketAndScrape, evidenceBrand === 'Unresolved Brand' ? undefined : evidenceBrand);
+	const auditHq = pickEvidenceSnippet(marketAndScrape, evidenceHq === 'Unresolved HQ Country' ? undefined : evidenceHq);
+	const isFlagged = false;
+	const flagReason = 'Search data is ambiguous; resolved using deterministic evidence fallback.';
+	const arbitrationLog = `${reason}. OFF/search fallback resolved brand/company/origin without OpenRouter.`;
+
+	return {
+		barcode: args.barcode,
+		product: {
+			verified_name: productName,
+			name: productName,
+			brand: evidenceBrand,
+			ultimate_parent: evidenceParent,
+			parent: evidenceParent,
+			hq: evidenceHq,
+			category: evidenceCategory,
+			confidence
+		},
+		audit: {
+			parent_evidence: auditParent,
+			hq_evidence: auditHq
+		},
+		forensic_report: {
+			scraper_blocked: false,
+			serper_fallback_active: false,
+			ground_truth_source: args.offProduct ? 'OFF' : 'Serper',
+			rationale: reason
+		},
+		forensic_audit: {
+			scraper_blocked: false,
+			serper_snippets_received: args.snippetsCount,
+			source_hierarchy: buildSourceHierarchy({
+				serperPrimary: Boolean(args.searchPresent),
+				scraperAvailable: Boolean(args.deepScrape),
+				offAvailable: Boolean(args.offData),
+				internalFallback: !args.searchPresent && !args.offData
+			}),
+			conflict_resolved: true,
+			rationale: 'Deterministic evidence fallback resolved the product without OpenRouter.'
+		},
+		telemetry: {
+			search_present: args.searchPresent,
+			snippets_count: args.snippetsCount,
+			arbitration_path: 'evidence_fallback',
+			search_data_received: args.searchPresent,
+			key_indicators: args.keyIndicators,
+			decision_logic: reason
+		},
+		verification: {
+			sources_synced: sourcesSynced,
+			conflicts_resolved: 'Resolved via deterministic evidence fallback after OpenRouter failure.',
+			confidence_score: confidence
+		},
+		product_identity: {
+			verified_name: productName,
+			brand: evidenceBrand,
+			verified_brand: evidenceBrand,
+			category: evidenceCategory,
+			confidence_score: confidence
+		},
+		origin_data: {
+			physical_origin: evidenceOrigin,
+			legal_prefix_country: prefix
+		},
+		origin_details: {
+			physical_origin_country: evidenceOrigin,
+			legal_registration_prefix: prefix,
+			source_of_origin: 'Derived from OFF and live evidence fallback.'
+		},
+		corporate_structure: {
+			ultimate_parent_company: evidenceParent,
+			global_hq_country: evidenceHq
+		},
+		corporate_hierarchy: {
+			immediate_owner: evidenceBrand,
+			ultimate_parent: evidenceParent,
+			parent_hq_country: evidenceHq,
+			ownership_chain: `${evidenceBrand} -> ${evidenceBrand} -> ${evidenceParent}`
+		},
+		compliance: {
+			is_flagged: isFlagged,
+			flag_reason: null,
+			reason: null
+		},
+		ownership_structure: {
+			manufacturer: evidenceBrand,
+			ultimate_parent: evidenceParent,
+			parent_hq_country: evidenceHq
+		},
+		compliance_status: {
+			is_flagged: isFlagged,
+			flag_reason: null
+		},
+		arbitration_log: arbitrationLog,
+		product_name: productName,
+		verified_brand: evidenceBrand,
+		brand: evidenceBrand,
+		legal_holding_company: evidenceParent,
+		holding_company_hq: evidenceHq,
+		country_of_origin: evidenceOrigin,
+		is_flagged: isFlagged,
+		flag_reason: flagReason,
+		confidence_score: confidence,
+		source_attribution: sourceAttribution,
+		data_sources_used: args.sourcesUsed,
+		parent_company: evidenceParent,
+		origin_country: evidenceOrigin,
+		reasoning: arbitrationLog,
+		verification_card_label: 'Forensic Audit'
+	};
+}
+
+async function callOpenRouterAnalyzer(args: {
+	barcode: string;
+	registryData: string;
+	marketPulse: string;
+	offData: string;
+	searchContext: string;
+	deepScrape: string;
+	hqPulse?: string;
+	truthBundleBlock: string;
+	evidenceBundle: string;
+	contextText: string;
+	searchPresent: boolean;
+	snippetsCount: number;
+	keyIndicators: string[];
+	arbitrationPath: string;
+	offProduct: OpenFoodFactsProduct | null;
+	sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'>;
 }): Promise<OpenRouterAnalyzerResult> {
 	if (!OPENROUTER_API_KEY) {
-		const fallback = fallbackCorporateResult(args.barcode);
+		const fallback = buildEvidenceDrivenFallback(args, 'OpenRouter API key missing; using deterministic evidence fallback');
 		return {
 			...fallback,
 			flag_reason: `${fallback.flag_reason} (OPENROUTER_API_KEY missing, using local fallback).`,
@@ -1322,6 +2669,9 @@ ${args.deepScrape || 'EMPTY_DEEP_SCRAPE'}
 <hq_pulse>
 ${args.hqPulse || 'EMPTY_HQ_PULSE'}
 </hq_pulse>
+<evidence_bundle>
+${args.evidenceBundle || 'EMPTY_EVIDENCE_BUNDLE'}
+</evidence_bundle>
 ${args.truthBundleBlock}`;
 
 	console.log(
@@ -1349,7 +2699,7 @@ ${args.truthBundleBlock}`;
 	});
 
 	if (!response.ok) {
-		const fallback = fallbackCorporateResult(args.barcode);
+		const fallback = buildEvidenceDrivenFallback(args, `OpenRouter ${response.status} fallback`);
 		return {
 			...fallback,
 			flag_reason: `${fallback.flag_reason} (OpenRouter ${response.status} fallback).`,
@@ -1458,8 +2808,14 @@ ${args.truthBundleBlock}`;
 
 		// Evidence-driven inference: prefer explicit evidence snippets over hardcoded overrides.
 		try {
-			const inferredParent = inferParentFromEvidence(`${args.marketPulse}\n${args.deepScrape}\n${args.truthBundleBlock || ''}`);
-			if (inferredParent && isUnresolved(legalHoldingCompany)) {
+			const parentEvidenceContext = `${args.marketPulse}\n${args.deepScrape}\n${args.truthBundleBlock || ''}`;
+			const inferredParent = inferParentFromEvidence(parentEvidenceContext, offBrand || brand || verifiedName);
+			// Only promote an inferred parent when there's explicit snippet evidence supporting the company mention
+			if (
+				inferredParent &&
+				isUnresolved(legalHoldingCompany) &&
+				companyValueHasEvidenceSupport(inferredParent, parentEvidenceContext, offBrand || brand || verifiedName)
+			) {
 				legalHoldingCompany = inferredParent;
 				arbitrationLog = `${arbitrationLog} Inferred ultimate parent from market/deep-crawl evidence: ${inferredParent}.`;
 			}
@@ -1621,7 +2977,7 @@ ${args.truthBundleBlock}`;
 		};
 	} catch (e) {
 		console.error(`🚨 [SCHEMA_FAIL] Failed to parse OpenRouter content for ${args.barcode}. RawStart=${String(content).slice(0,200)}`, e);
-		const fallback = fallbackCorporateResult(args.barcode);
+		const fallback = buildEvidenceDrivenFallback(args, 'OpenRouter JSON parse fallback');
 		return {
 			...fallback,
 			flag_reason: `${fallback.flag_reason} (JSON parse fallback).`,
@@ -1755,6 +3111,98 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 	};
 }
 
+async function checkAndDecrementQuota(userId: string): Promise<ScanQuota> {
+	try {
+		const adminSupabase = getAdminSupabase() as unknown as {
+			from: (table: string) => {
+				select: (columns: string) => {
+					eq: (column: string, value: string) => {
+						maybeSingle: () => Promise<{
+							data: { plan?: string; scan_limit?: number; scans_used?: number; period_end?: string } | null;
+							error: unknown;
+						}>;
+					};
+				};
+				update: (values: Record<string, unknown>) => {
+					eq: (column: string, value: string) => Promise<{ error: unknown }>;
+				};
+			};
+		};
+
+		const { data, error } = await adminSupabase
+			.from('subscriptions')
+			.select('plan,scan_limit,scans_used,period_end')
+			.eq('user_id', userId)
+			.maybeSingle();
+
+		if (error || !data) {
+			return { allowed: true, plan: 'free', scansRemaining: 15 };
+		}
+
+		const plan = data.plan === 'supporter' ? 'supporter' : 'free';
+		const scanLimit = typeof data.scan_limit === 'number' ? data.scan_limit : plan === 'supporter' ? 999_999 : 15;
+		const scansUsed = typeof data.scans_used === 'number' ? data.scans_used : 0;
+		const periodEnd = data.period_end ? new Date(data.period_end) : new Date(0);
+		const now = new Date();
+
+		if (now > periodEnd) {
+			await adminSupabase
+				.from('subscriptions')
+				.update({
+					scans_used: 0,
+					period_start: now.toISOString(),
+					period_end: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString()
+				})
+				.eq('user_id', userId);
+			return { allowed: true, plan, scansRemaining: scanLimit };
+		}
+
+		const scansRemaining = Math.max(0, scanLimit - scansUsed);
+		if (scansRemaining <= 0) {
+			return {
+				allowed: false,
+				plan,
+				scansRemaining: 0,
+				reason: plan === 'free' ? 'You have used all free scans for this period.' : 'Monthly scan limit reached.'
+			};
+		}
+
+		await adminSupabase.from('subscriptions').update({ scans_used: scansUsed + 1 }).eq('user_id', userId);
+		return { allowed: true, plan, scansRemaining: scansRemaining - 1 };
+	} catch {
+		return { allowed: true, plan: 'free', scansRemaining: 99 };
+	}
+}
+
+async function saveScanHistory(userId: string, barcode: string, result: OpenRouterCorporateOutput): Promise<void> {
+	try {
+		const adminSupabase = getAdminSupabase() as unknown as {
+			from: (table: string) => {
+				upsert: (values: Record<string, unknown>, options?: { onConflict?: string }) => Promise<{ error: unknown }>;
+			};
+		};
+
+		await adminSupabase.from('scan_history').upsert(
+			{
+				user_id: userId,
+				barcode,
+				product_name: normalizeText(result.product?.name || result.product_name) || 'Unknown',
+				brand: normalizeText(result.brand || result.product?.brand) || 'Unknown',
+				parent_company: normalizeText(result.parent_company || result.legal_holding_company) || 'Unknown',
+				origin_country: normalizeText(result.origin_country || result.country_of_origin) || 'Unknown',
+				parent_hq_country: normalizeText(result.parent_hq_country || result.holding_company_hq) || 'Unknown',
+				category: normalizeText(result.category || result.product?.category || result.product_identity?.category) || 'Unknown',
+				is_flagged: Boolean(result.is_flagged),
+				confidence_score: result.confidence_score || result.product?.confidence || 0,
+				scanned_at: new Date().toISOString()
+			},
+			{ onConflict: 'user_id,barcode' }
+		);
+	} catch {
+		// Non-fatal history writes should not break scans.
+	}
+}
+
 async function cacheScanResult(result: {
     barcode: string;
     brand: string;
@@ -1787,25 +3235,38 @@ async function cacheScanResult(result: {
 	}
 }
 
-async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
-	const cached = await loadCachedProduct(barcode);
+async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}): Promise<OpenRouterCorporateOutput> {
+	const cameraInputProvided = Boolean(normalizeText(cameraInput.ocr_text || cameraInput.image_data_url || cameraInput.image_base64 || cameraInput.image_url || ''));
+	const cameraEvidence = cameraInputProvided
+		? await resolveCameraEvidence(cameraInput).catch(() => ({ ocrText: '', source: null, prompt: '' }))
+		: { ocrText: '', source: null, prompt: '' };
+	const cached = cameraInputProvided ? null : await loadCachedProduct(barcode);
 	if (cached) {
 		const cachedRow = cached as OpenRouterCorporateOutput & { category?: string; country_of_origin?: string };
 		const cachedParent = normalizeText(cached.product?.ultimate_parent || cached.parent_company || '');
 		const cachedHq = normalizeText(cached.product?.hq || cached.corporate_structure?.global_hq_country || '');
+		const cachedBrand = normalizeText(cached.product?.brand || cached.brand || '');
 		const cachedOrigin = normalizeText(cachedRow.origin_country || cachedRow.country_of_origin || '');
 		const cachedCategory = normalizeText(cachedRow.category || cached.product?.category || '');
+		const cachedSource = normalizeText((cached as { source_attribution?: string }).source_attribution);
+		const cachedArbitrationLog = normalizeText((cached as { arbitration_log?: string }).arbitration_log);
 		const cachedOriginCanonical = inferCountryFromText(cachedOrigin);
 		const cachedParentLooksNoisy =
 			/cnn|following is a list|google search|shopping|results?|^org-|^the following/i.test(cachedParent) ||
 			cachedParent.length > 60;
+		const cachedBrandLooksLikeProduct = looksLikeProductLabel(cachedBrand) || /\b(drink|dates|biscuits|chocolate|soda|juice|water|snack)\b/i.test(cachedBrand);
+		const cachedLooksStale = cachedSource === 'Internal_Knowledge' && /loaded from cache/i.test(cachedArbitrationLog);
+		const cachedNeedsRefresh = false; // Only bypass on explicit unresolved signals above
 		if (
 			isUnresolved(cachedParent) ||
 			isUnresolved(cachedHq) ||
 			isUnresolved(cachedOrigin) ||
 			!cachedOriginCanonical ||
 			isUnresolved(cachedCategory) ||
-			cachedParentLooksNoisy
+			cachedNeedsRefresh ||
+			cachedParentLooksNoisy ||
+			cachedBrandLooksLikeProduct ||
+			cachedLooksStale
 		) {
 			console.log(`⚠️ [CACHE] Bypassing stale unresolved cache for ${barcode} so live evidence can re-run.`);
 		} else {
@@ -1826,26 +3287,219 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		}
 	}
 
-	const offLookup = await lookupOpenFoodFactsProduct(barcode).catch(() => ({ product: null, statusCode: 0 }));
-	const marketPulseSearch = (await serperPrimarySearchWithRetry(barcode).catch(() => ({ result: { query: '', contextText: '', statusCode: 0, used: false, snippetCount: 0 }, retried: false }))) as SerperPrimaryResult;
+	const barcodeValidation = validateBarcode(barcode);
+	const gs1RegistrationCountry = barcodeValidation.gs1Country || lookupGs1Country(barcode);
+	console.log(`🔢 [BARCODE] type=${barcodeValidation.type} valid=${barcodeValidation.valid} gs1=${gs1RegistrationCountry}`);
+	if (cameraEvidence.prompt) console.log(`📷 [CAMERA] ${cameraEvidence.prompt}`);
+	const cameraIdentity = cameraEvidence.ocrText
+		? extractProductIdentityFromEvidence(cameraEvidence.ocrText, cameraEvidence.ocrText, cameraEvidence.ocrText, cameraEvidence.ocrText)
+		: {};
+	const cameraProductName = normalizeText(cameraIdentity.productName || '');
+	const cameraBrandMatch = cameraEvidence.ocrText.match(/\b([A-Z][A-Za-z0-9&'-]{2,40}(?:\s+[A-Z][A-Za-z0-9&'-]{2,40}){0,3})\b/);
+	const cameraParentMatch = cameraEvidence.ocrText.match(
+		/(?:imported by|distributed by|manufactured by|made by|packed by|packed for|manufactured for|licensed by|distributed for)\s+([A-Z][A-Za-z0-9&.,'\-\s]{2,80})/i
+	);
+	const cameraBrandFromOcr = normalizeText(
+		cameraIdentity.brand ||
+		cameraBrandMatch?.[1] ||
+		extractBrandLeadFromMarketContext(cameraEvidence.ocrText) ||
+		deriveBrandFromProductName(cameraProductName) ||
+		''
+	);
+	const cameraParentCompany = normalizeCompanyName(
+		cameraParentMatch?.[1] ||
+		(cameraEvidence.ocrText ? inferParentFromEvidence(cameraEvidence.ocrText, cameraBrandFromOcr || cameraProductName) : '')
+	).replace(/\s+(?:head office|headquarters|hq)\b.*$/i, '');
+	const cameraOriginCountry = normalizeCountryCandidate(
+		cameraEvidence.ocrText
+			? inferOriginCountryFromEvidence(cameraEvidence.ocrText, cameraBrandFromOcr || cameraParentCompany || cameraProductName)
+			: ''
+	);
+	const cameraHqCountry = normalizeCountryCandidate(
+		cameraEvidence.ocrText
+			? inferHqCountryFromEvidence(cameraEvidence.ocrText, cameraParentCompany || cameraBrandFromOcr || cameraProductName)
+			: ''
+	);
+	const cameraOnlyMode = cameraInputProvided && !normalizeText(barcode);
+
+	if (cameraOnlyMode) {
+		console.log('📷 [CAMERA_ONLY] Running camera-first scan without a valid barcode.');
+		const cameraSubject = cameraBrandFromOcr || cameraProductName || normalizeText(cameraEvidence.ocrText.split(/\r?\n/)[0] || '') || 'Camera Product';
+		const cameraSearch = await serperPrimarySearchWithRetry(cameraSubject).catch(() => ({
+			result: { query: cameraSubject, contextText: '', statusCode: 0, used: false, snippetCount: 0 },
+			retried: false,
+			primaryQuery: cameraSubject,
+			retryQuery: null,
+			firstAttemptSnippets: 0
+		}));
+		const cameraScrape = await semanticGoogleScrape(cameraSubject).catch(() => ({ blocked: true, hasContext: false, statusCode: 0, contextText: '' }));
+		const cameraPublicVerification = await withTimeout(
+			runPublicVerificationPass(cameraSubject).catch(() => null),
+			6000,
+			null
+		);
+		const cameraOffContext = [
+			`CAMERA_OCR_TEXT: ${cameraEvidence.ocrText || 'Unresolved OCR Text'}`,
+			cameraProductName ? `CAMERA_PRODUCT_NAME: ${cameraProductName}` : '',
+			cameraBrandFromOcr ? `CAMERA_BRAND: ${cameraBrandFromOcr}` : '',
+			cameraParentCompany ? `CAMERA_PARENT_COMPANY: ${cameraParentCompany}` : '',
+			cameraOriginCountry ? `CAMERA_ORIGIN_COUNTRY: ${cameraOriginCountry}` : '',
+			cameraHqCountry ? `CAMERA_HQ_COUNTRY: ${cameraHqCountry}` : ''
+		].filter(Boolean).join('\n');
+		const cameraEvidenceBundle = buildEvidenceBundle({
+			barcode: cameraSubject,
+			offProduct: null,
+			offBrand: cameraBrandFromOcr,
+			offOriginCountry: cameraOriginCountry,
+			offCategory: 'Unresolved Category',
+			offParentCompany: cameraParentCompany,
+			publicVerification: cameraPublicVerification,
+			searchContext: cameraSearch.result.contextText,
+			deepScrape: cameraScrape.contextText,
+			hqPulse: '',
+			truthBundleBlock: cameraOffContext
+		});
+		const cameraResult = await callOpenRouterAnalyzer({
+			barcode: cameraSubject,
+			registryData: cameraOffContext,
+			marketPulse: cameraSearch.result.contextText,
+			offData: cameraOffContext,
+			searchContext: cameraSearch.result.contextText,
+			deepScrape: cameraScrape.contextText,
+			hqPulse: '',
+			truthBundleBlock: cameraOffContext,
+			evidenceBundle: `<evidence_bundle>\n<product_name>${cameraEvidenceBundle.product_name}</product_name>\n<brand>${cameraEvidenceBundle.brand}</brand>\n<parent_company>${cameraEvidenceBundle.parent_company}</parent_company>\n<parent_hq_country>${cameraEvidenceBundle.parent_hq_country}</parent_hq_country>\n<origin_country>${cameraEvidenceBundle.origin_country}</origin_country>\n<category>${cameraEvidenceBundle.category}</category>\n<sources>${cameraEvidenceBundle.sources.join(' | ')}</sources>\n</evidence_bundle>`,
+			contextText: cameraSearch.result.contextText,
+			searchPresent: Boolean(cameraSearch.result.contextText),
+			snippetsCount: cameraSearch.result.snippetCount ?? 0,
+			keyIndicators: extractKeyIndicators(cameraEvidence.ocrText),
+			arbitrationPath: 'camera_first',
+			offProduct: null,
+			sourcesUsed: [cameraSearch.result.contextText ? 'Search_Scrape' : 'Internal_Knowledge']
+		});
+		cameraResult.product.brand = cameraResult.product.brand || cameraBrandFromOcr || 'Unresolved Brand';
+		cameraResult.brand = cameraResult.brand || cameraResult.product.brand;
+		cameraResult.verified_brand = cameraResult.verified_brand || cameraResult.product.brand;
+		cameraResult.parent_company = cameraResult.parent_company || cameraParentCompany || 'Unresolved Parent';
+		cameraResult.legal_holding_company = cameraResult.legal_holding_company || cameraResult.parent_company;
+		cameraResult.parent_hq_country = cameraResult.parent_hq_country || cameraHqCountry || 'Unresolved HQ Country';
+		cameraResult.holding_company_hq = cameraResult.holding_company_hq || cameraResult.parent_hq_country;
+		cameraResult.origin_country = cameraResult.origin_country || cameraOriginCountry || 'Unresolved Origin';
+		cameraResult.country_of_origin = cameraResult.country_of_origin || cameraResult.origin_country;
+		cameraResult.product_name = cameraResult.product_name || cameraProductName || `Camera Product ${barcode || ''}`.trim();
+		cameraResult.product.verified_name = cameraResult.product.verified_name || cameraResult.product_name;
+		cameraResult.product.name = cameraResult.product.name || cameraResult.product_name;
+		cameraResult.product_identity.verified_name = cameraResult.product_identity.verified_name || cameraResult.product_name;
+		cameraResult.product_identity.brand = cameraResult.product_identity.brand || cameraResult.product.brand;
+		cameraResult.product_identity.verified_brand = cameraResult.product_identity.verified_brand || cameraResult.product.brand;
+		cameraResult.corporate_structure.ultimate_parent_company = cameraResult.corporate_structure.ultimate_parent_company || cameraResult.parent_company;
+		cameraResult.corporate_structure.global_hq_country = cameraResult.corporate_structure.global_hq_country || cameraResult.parent_hq_country;
+		const cameraCorporateHierarchy = cameraResult.corporate_hierarchy || {
+			immediate_owner: cameraResult.product.brand,
+			ultimate_parent: cameraResult.parent_company,
+			parent_hq_country: cameraResult.parent_hq_country,
+			ownership_chain: `${cameraResult.product.brand} -> ${cameraResult.parent_company}`
+		};
+		cameraCorporateHierarchy.immediate_owner = cameraCorporateHierarchy.immediate_owner || cameraResult.product.brand;
+		cameraCorporateHierarchy.ultimate_parent = cameraCorporateHierarchy.ultimate_parent || cameraResult.parent_company;
+		cameraCorporateHierarchy.parent_hq_country = cameraCorporateHierarchy.parent_hq_country || cameraResult.parent_hq_country;
+		cameraResult.corporate_hierarchy = cameraCorporateHierarchy;
+		cameraResult.ownership_structure.manufacturer = cameraResult.ownership_structure.manufacturer || cameraResult.product.brand;
+		cameraResult.ownership_structure.ultimate_parent = cameraResult.ownership_structure.ultimate_parent || cameraResult.parent_company;
+		cameraResult.ownership_structure.parent_hq_country = cameraResult.ownership_structure.parent_hq_country || cameraResult.parent_hq_country;
+		if (cameraEvidence.prompt || isUnresolved(cameraResult.parent_company) || isUnresolved(cameraResult.parent_hq_country) || isUnresolved(cameraResult.brand)) {
+			cameraResult.scan_guidance = {
+				next_step: 'camera_ocr',
+				message: cameraEvidence.prompt || 'Move closer to the label and capture the front panel so OCR can read the brand and manufacturer.'
+			};
+		}
+		return cameraResult;
+	}
+
+	const emptyOffLookup = { product: null, statusCode: 0 };
+	const emptyMarketPulseSearch: SerperPrimaryResult = {
+		result: { query: '', contextText: '', statusCode: 0, used: false, snippetCount: 0 },
+		retried: false,
+		primaryQuery: '',
+		retryQuery: null,
+		firstAttemptSnippets: 0
+	};
+	const emptyScrape = { blocked: true, hasContext: false, statusCode: 0, contextText: '' };
+
+	const [offLookup, marketPulseSearch, scrape] = await Promise.all([
+		withTimeout(lookupOpenFoodFactsProduct(barcode).catch(() => emptyOffLookup), 8000, emptyOffLookup),
+		withTimeout(serperPrimarySearchWithRetry(barcode).catch(() => emptyMarketPulseSearch), 10000, emptyMarketPulseSearch),
+		withTimeout(semanticGoogleScrape(barcode).catch(() => emptyScrape), 8000, emptyScrape)
+	]);
+
 	let marketPulse = marketPulseSearch.result;
 
 	let offProduct = offLookup.product;
 	const offBrandParsed = parseOffBrandDeep(offProduct);
-	const offBrand = offBrandParsed.brand || normalizeText(offProduct?.brand_owner) || '';
-	const offOriginCountry = extractOffOriginCountry(offProduct);
+	const offBrand = offBrandParsed.brand || normalizeText(offProduct?.brand_owner) || cameraBrandFromOcr || '';
+	const offOriginCountry = cameraOriginCountry || extractOffOriginCountry(offProduct);
 	const offCategory = extractOffCategory(offProduct);
-	const offParentCompany = extractOffParentCompany(offProduct);
+	const offParentCompany = cameraParentCompany || extractOffParentCompany(offProduct);
+	const upcItemDBResult = !offProduct?.product_name ? await lookupUPCItemDB(barcode) : null;
+	const brandForWiki = offBrand || upcItemDBResult?.brand || cameraBrandFromOcr || '';
+	const wikiResult = brandForWiki && !offParentCompany ? await lookupWikipediaBrand(brandForWiki) : null;
+	const publicVerification = await withTimeout(
+		runPublicVerificationPass(
+			offParentCompany || wikiResult?.parentCompany || cameraParentCompany || cameraBrandFromOcr || offBrand || normalizeText(offProduct?.product_name) || barcode,
+			normalizeText((offProduct as { website?: string } | null)?.website || '')
+		).catch(() => null),
+		6000,
+		null
+	);
+	if (publicVerification) {
+		console.log(`🛰️ [PUBLIC_VERIFY] source=${publicVerification.source} company=${publicVerification.company} hq=${publicVerification.hqCountry}`);
+	}
 	let offContext = offProduct ? buildOpenFoodFactsContext(offProduct) : '';
+	if (upcItemDBResult && !offProduct) {
+		const upcLines = [
+			`UPC_ITEMDB product_name: ${upcItemDBResult.title || 'Unresolved Product'}`,
+			`UPC_ITEMDB brand: ${upcItemDBResult.brand || 'Unresolved Brand'}`,
+			`UPC_ITEMDB category: ${upcItemDBResult.category || 'Unresolved Category'}`,
+			`UPC_ITEMDB description: ${upcItemDBResult.description || ''}`
+		].filter(Boolean).join('\n');
+		offContext = offContext ? `${offContext}\n${upcLines}` : upcLines;
+	}
+	if (wikiResult?.summary) {
+		const wikiLines = [
+			`WIKIPEDIA brand_summary: ${wikiResult.summary}`,
+			wikiResult.parentCompany ? `WIKIPEDIA parent_company: ${wikiResult.parentCompany}` : '',
+			wikiResult.country ? `WIKIPEDIA country: ${wikiResult.country}` : ''
+		].filter(Boolean).join('\n');
+		offContext = offContext ? `${offContext}\n${wikiLines}` : wikiLines;
+	}
+	if (cameraEvidence.ocrText) {
+		const cameraLines = [
+			`CAMERA_OCR_TEXT: ${cameraEvidence.ocrText}`,
+			cameraProductName ? `CAMERA_PRODUCT_NAME: ${cameraProductName}` : '',
+			cameraBrandFromOcr ? `CAMERA_BRAND: ${cameraBrandFromOcr}` : '',
+			cameraParentCompany ? `CAMERA_PARENT_COMPANY: ${cameraParentCompany}` : '',
+			cameraOriginCountry ? `CAMERA_ORIGIN_COUNTRY: ${cameraOriginCountry}` : '',
+			cameraHqCountry ? `CAMERA_HQ_COUNTRY: ${cameraHqCountry}` : ''
+		].filter(Boolean).join('\n');
+		offContext = offContext ? `${offContext}\n${cameraLines}` : cameraLines;
+	}
+	if (gs1RegistrationCountry && gs1RegistrationCountry !== 'Unresolved GS1 Country') {
+		offContext = `${offContext}\nGS1_REGISTRATION_COUNTRY: ${gs1RegistrationCountry} (barcode prefix registration — indicates legal/commercial origin, not necessarily manufacturing location)`;
+	}
+	const evidenceBundle = buildEvidenceBundle({
+		barcode,
+		offProduct,
+		offBrand,
+		offOriginCountry,
+		offCategory,
+		offParentCompany,
+		publicVerification,
+		searchContext: '',
+		deepScrape: scrape.contextText || '',
+		hqPulse: '',
+		truthBundleBlock: offContext
+	});
 	console.log(`📥 [OFF] Status: ${offLookup.statusCode}`);
-
-
-	const scrape = await semanticGoogleScrape(barcode).catch(() => ({
-		blocked: true,
-		hasContext: false,
-		statusCode: 0,
-		contextText: ''
-	}));
 
 	// If OFF is missing/404 or Serper returned no snippets, run hard compensation searches
 	if ((!offLookup.product || offLookup.statusCode === 404) && (marketPulse.snippetCount ?? 0) === 0) {
@@ -1881,7 +3535,8 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		offProduct &&
 		offDomain !== 'unknown' &&
 		marketDomain !== 'unknown' &&
-		offDomain !== marketDomain
+		offDomain !== marketDomain &&
+		(marketPulse.snippetCount ?? 0) >= 3
 	) {
 		registryOverrideNote = `Rejected stale registry entry as metadata ghost (registry domain: ${offDomain}, market domain: ${marketDomain}). Ground truth locked to live market pulse.`;
 		offProduct = null;
@@ -1909,9 +3564,19 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		);
 	}
 
-	const registryData = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA'].filter(Boolean).join('\n');
+	const publicVerificationContext = publicVerification
+		? [
+			`PUBLIC_VERIFY source: ${publicVerification.source}`,
+			`PUBLIC_VERIFY company: ${publicVerification.company}`,
+			`PUBLIC_VERIFY hq_country: ${publicVerification.hqCountry}`,
+			`PUBLIC_VERIFY website: ${publicVerification.website || 'Unresolved Website'}`,
+			`PUBLIC_VERIFY evidence: ${publicVerification.evidence}`
+		].join('\n')
+		: '';
+	const registryData = [registryOverrideNote, offContext || 'NO_REGISTRY_DATA', publicVerificationContext].filter(Boolean).join('\n');
 	const marketPulseData = marketEvidenceContext || 'NO_MARKET_PULSE_DATA';
 	const offData = buildOpenFoodFactsContext(offProduct || { product_name: 'Unresolved Product', categories: 'Unresolved Category', countries: 'Unresolved Origin', ingredients_text: '' });
+	const evidenceBundleBlock = `<evidence_bundle>\n<product_name>${evidenceBundle.product_name}</product_name>\n<brand>${evidenceBundle.brand}</brand>\n<parent_company>${evidenceBundle.parent_company}</parent_company>\n<parent_hq_country>${evidenceBundle.parent_hq_country}</parent_hq_country>\n<origin_country>${evidenceBundle.origin_country}</origin_country>\n<category>${evidenceBundle.category}</category>\n<sources>${evidenceBundle.sources.join(' | ')}</sources>\n</evidence_bundle>`;
 	let searchContext = marketPulseData;
 	// Exhaustive Google UI noise stripping before AI reads context
 	searchContext = searchContext.replace(/Google Search|Images|Videos|Shopping|Sign in|Settings|Skip to main content|All filters|Tools|SafeSearch/gi, '');
@@ -1926,7 +3591,15 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	console.log(`🔍 [DEBUG] corporateCrawl.contextText.length=${corporateCrawl.contextText?.length || 0}`);
 	console.log(`🔍 [DEBUG] scrape.contextText.length=${scrape.contextText?.length || 0}`);
 
-	const deepScrape = corporateCrawl.contextText || scrape.contextText || 'NO_DEEP_SCRAPE_DATA';
+	let deepScrape = 'NO_DEEP_SCRAPE_DATA';
+	if (corporateCrawl.contextText && corporateCrawl.contextText.length > 50) {
+		deepScrape = corporateCrawl.contextText;
+	} else if (scrape.contextText && scrape.contextText.length > 50) {
+		deepScrape = scrape.contextText;
+	} else if (corporateCrawl.contextText) {
+		// fallback to corporateCrawl even if short, prefer corporateCrawl over noisy scrape
+		deepScrape = corporateCrawl.contextText;
+	}
 
 	console.log(`🔍 [DEBUG] deepScrape final length=${deepScrape.length} first100chars=${deepScrape.slice(0, 100)}`);
 
@@ -1998,7 +3671,8 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 
 	// Attempt to extract a brand lead from market/crawl/registry for HQ pulse probing
 	const brandLead = extractBrandLeadFromMarketContext(marketPulse.contextText || corporateCrawl.contextText || offContext || '');
-	const hqQuery = brandLead ? `${brandLead} global headquarters country` : `${brandLead || ''} global headquarters country`;
+	const hqSubject = brandLead || offParentCompany || offBrand || normalizeText(offProduct?.product_name) || barcode;
+	const hqQuery = `${hqSubject} global headquarters country`;
 	const hqPulse = await serperSearch(hqQuery).catch(() => ({
 		query: hqQuery,
 		contextText: '',
@@ -2018,6 +3692,7 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		deepScrape,
 		hqPulse: hqPulse.contextText || '',
 		truthBundleBlock,
+		evidenceBundle: evidenceBundleBlock,
 		contextText: mergedContext,
 		searchPresent: Boolean(marketPulse.contextText || scrape.contextText),
 		snippetsCount,
@@ -2079,7 +3754,75 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 			if (ai.ownership_structure) ai.ownership_structure.ultimate_parent = offParentCompany;
 		}
 
+		if (offParentCompany && !isUnresolved(offParentCompany)) {
+			ai.parent_company = offParentCompany;
+			ai.legal_holding_company = offParentCompany;
+			if (ai.product) {
+				ai.product.ultimate_parent = offParentCompany;
+				ai.product.parent = offParentCompany;
+			}
+			if (ai.corporate_structure) ai.corporate_structure.ultimate_parent_company = offParentCompany;
+			if (ai.corporate_hierarchy) ai.corporate_hierarchy.ultimate_parent = offParentCompany;
+			if (ai.ownership_structure) ai.ownership_structure.ultimate_parent = offParentCompany;
+		}
+
 		ai.arbitration_log = `${normalizeText(ai.arbitration_log)} OFF reconciliation applied${searchLooksNoisy ? ' because search evidence was noisy or empty' : ''}.`.trim();
+	}
+	// Run verifier (LLM self-check + deterministic rules) to validate AI-extracted fields
+	try {
+		const llmSelf = await runLLMSelfCheck({
+			barcode,
+			evidenceBundleBlock: evidenceBundleBlock || '',
+			aiSnapshot: ai,
+			marketPulse: marketPulseData || '',
+			deepScrape: deepScrape || '',
+			registryData: registryData || '',
+			hqPulse: hqPulse?.contextText || ''
+		}).catch(() => null);
+
+		const verified: VerifiedResult = {
+			brand: scoreAndDecideField('brand', normalizeText(ai.brand || ai.product?.brand || ''), normalizeText(offParentCompany || ''), publicVerification || null, marketPulseData || '', deepScrape || '', llmSelf ?? undefined) as VerifiedField,
+			parent_company: scoreAndDecideField('parent_company', normalizeText(ai.parent_company || ai.legal_holding_company || ai.product?.ultimate_parent || ''), normalizeText(offParentCompany || ''), publicVerification || null, marketPulseData || '', deepScrape || '', llmSelf ?? undefined) as VerifiedField,
+			parent_hq_country: scoreAndDecideField(
+				'parent_hq_country',
+				normalizeText(ai.parent_hq_country || ai.holding_company_hq || ''),
+				null,
+				publicVerification || null,
+				marketPulseData || '',
+				deepScrape || '',
+				llmSelf ?? undefined,
+				normalizeText(ai.parent_company || ai.legal_holding_company || ai.product?.ultimate_parent || offParentCompany || ai.product?.parent || '')
+			) as VerifiedField,
+			origin_country: scoreAndDecideField('origin_country', normalizeText(ai.origin_country || ai.country_of_origin || ''), normalizeText(offOriginCountry || ''), publicVerification || null, marketPulseData || '', deepScrape || '', llmSelf ?? undefined) as VerifiedField,
+			category: scoreAndDecideField('category', normalizeText(ai.category || ai.product_identity?.category || ''), normalizeText(offCategory || ''), publicVerification || null, marketPulseData || '', deepScrape || '', llmSelf ?? undefined) as VerifiedField,
+			is_flagged: { value: !!ai.is_flagged || false, accepted: Boolean(ai.is_flagged), confidence: ai.is_flagged ? 0.9 : 0.1, supporting_sources: [] },
+			overall_confidence: 0.0,
+			notes: []
+		};
+
+		// compute simple overall confidence
+		verified.overall_confidence = Number(((verified.brand.confidence + verified.parent_company.confidence + verified.parent_hq_country.confidence + verified.origin_country.confidence + verified.category.confidence) / 5).toFixed(2));
+
+		// collect per-field provenance (do not assume ai.forensic_audit shape)
+		const perFieldProvenance = [
+			{ field: 'brand', result: verified.brand },
+			{ field: 'parent_company', result: verified.parent_company },
+			{ field: 'parent_hq_country', result: verified.parent_hq_country },
+			{ field: 'origin_country', result: verified.origin_country },
+			{ field: 'category', result: verified.category },
+			{ field: 'is_flagged', result: verified.is_flagged }
+		];
+
+		// Attach provenance as a non-invasive private property to ai (avoids typing issues)
+		(ai as unknown as Record<string, unknown>)['_forensic_provenance'] = perFieldProvenance;
+
+		// Apply accepted fields back to ai
+		applyVerificationToAi(ai, verified);
+
+		const perFieldSummary = perFieldProvenance.map((p) => ({ field: p.field, accepted: p.result.accepted, confidence: p.result.confidence }));
+		console.log(`🔐 [VERIFIER] overall_confidence=${verified.overall_confidence} per_field=${JSON.stringify(perFieldSummary)}`);
+	} catch (err) {
+		console.warn('🔐 [VERIFIER] verifier failed', err);
 	}
 
 	// GEOPOLITICAL AUDIT: probe for Israeli operations / funding ties for the inferred parent
@@ -2111,16 +3854,20 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 	ai.verification_card_label = 'Forensic Audit';
 	// Evidence-driven inference post-analysis: only populate parent/hq if unresolved and we have snippets
 	try {
-		let inferredParent = inferParentFromEvidence(`${marketPulseData}\n${deepScrape}\n${registryData}\n${hqPulse.contextText || ''}`);
+		let inferredParent = inferParentFromEvidence(`${marketPulseData}\n${deepScrape}\n${registryData}\n${hqPulse.contextText || ''}`, ai.brand || ai.product?.brand || offBrand || '');
 		if (!inferredParent) {
-			const brandFallback = normalizeText(ai.product?.brand || ai.product_identity?.brand || ai.brand || offBrand || '');
-			if (brandFallback && !isUnresolved(brandFallback)) {
+			const productNameFallback = normalizeText(ai.product?.name || ai.product_identity?.verified_name || offProduct?.product_name || `Barcode ${barcode}`);
+			const brandFallback = normalizeText(
+				ai.product?.brand || ai.product_identity?.brand || ai.brand || offBrand || deriveBrandFromProductName(productNameFallback) || ''
+			);
+			if (brandFallback && !isUnresolved(brandFallback) && isStrongCompanyCandidate(brandFallback)) {
 				inferredParent = brandFallback;
 			}
 		}
 		const inferredHq = inferHqCountryFromEvidence(`${hqPulse.contextText || marketPulseData}\n${deepScrape}`);
-		const brandFallback = normalizeText(ai.product?.brand || ai.product_identity?.brand || ai.brand || offBrand || '');
 		const productNameFallback = normalizeText(ai.product?.name || ai.product_identity?.verified_name || offProduct?.product_name || `Barcode ${barcode}`);
+		const derivedBrandFallback = deriveBrandFromProductName(productNameFallback);
+		const brandFallback = normalizeText(ai.product?.brand || ai.product_identity?.brand || ai.brand || offBrand || derivedBrandFallback || '');
 
 		if (!ai.audit) ai.audit = { parent_evidence: 'No snippet evidence available.', hq_evidence: 'No snippet evidence available.' };
 
@@ -2160,8 +3907,21 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 			ai.brand = brandFallback;
 			ai.verified_brand = brandFallback;
 		}
+		if (derivedBrandFallback && looksLikeProductLabel(ai.product?.brand || '') && !isUnresolved(derivedBrandFallback)) {
+			ai.product.brand = derivedBrandFallback;
+			ai.product_identity.brand = derivedBrandFallback;
+			ai.product_identity.verified_brand = derivedBrandFallback;
+			ai.brand = derivedBrandFallback;
+			ai.verified_brand = derivedBrandFallback;
+			ai.arbitration_log = `${ai.arbitration_log} Promoted brand from recovered product name: ${derivedBrandFallback}.`;
+		}
 
-		if (inferredParent && isUnresolved(ai.product?.ultimate_parent)) {
+		if (
+			inferredParent &&
+			isUnresolved(ai.product?.ultimate_parent) &&
+			isStrongCompanyCandidate(inferredParent) &&
+			companyValueHasEvidenceSupport(inferredParent, `${marketPulseData}\n${deepScrape}\n${registryData}`, ai.brand || ai.product?.brand || offBrand || '')
+		) {
 			const p = inferredParent;
 			ai.product.ultimate_parent = p;
 			ai.product.parent = p;
@@ -2190,39 +3950,105 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 		// Non-fatal: continue with AI output
 	}
 
+	let supplementalCorporateContext = '';
+	try {
+		const unresolvedCorporateFields =
+			isUnresolved(ai.parent_company) ||
+			isUnresolved(ai.legal_holding_company) ||
+			isUnresolved(ai.parent_hq_country) ||
+			isUnresolved(ai.holding_company_hq) ||
+			isUnresolved(ai.origin_country) ||
+			isUnresolved(ai.country_of_origin);
+		if (unresolvedCorporateFields) {
+			const supplementalSubject = normalizeText(
+				offParentCompany ||
+					ai.parent_company ||
+					ai.legal_holding_company ||
+					offBrand ||
+					ai.brand ||
+					ai.product?.brand ||
+					ai.product?.name ||
+					offProduct?.product_name ||
+					ai.product_identity?.verified_name ||
+					barcode
+			);
+			const supplemental = await runSupplementalCorporateSearch(supplementalSubject, barcode);
+			supplementalCorporateContext = supplemental.contextText || '';
+			if (supplementalCorporateContext) {
+				ai.arbitration_log = `${ai.arbitration_log} Supplemental Serper evidence gathered for unresolved corporate fields.`;
+			}
+		}
+	} catch {
+		// Supplemental search is best-effort only.
+	}
+
+	const finalEvidenceContext = [marketPulseData, deepScrape, registryData, hqPulse.contextText || '', supplementalCorporateContext, cameraEvidence.ocrText]
+		.filter(Boolean)
+		.join('\n');
+	const productAnchor = normalizeText(ai.product?.name || ai.product_identity?.verified_name || offProduct?.product_name || ai.brand || ai.product?.brand || offBrand || '');
+	const parentAnchor = normalizeText(ai.brand || ai.product?.brand || offBrand || productAnchor);
+
 	const finalOriginCountry =
 		!isUnresolved(offOriginCountry)
 			? offOriginCountry
-			: inferOriginCountryFromEvidence(`${marketPulseData}\n${deepScrape}\n${registryData}\n${hqPulse.contextText || ''}`) ||
-				normalizeText(ai.origin_country || ai.country_of_origin || ai.origin_data?.physical_origin) ||
-				'Unresolved Origin';
+			: normalizeCountryCandidate(
+					inferOriginCountryFromEvidence(finalEvidenceContext, productAnchor || parentAnchor) ||
+					''
+			  ) ||
+				(gs1RegistrationCountry && gs1RegistrationCountry !== 'Unresolved GS1 Country' ? gs1RegistrationCountry : 'GS1 Country Unmapped');
 	const finalParentCompanyRaw =
-		!isUnresolved(offParentCompany)
-			? offParentCompany
-			: normalizeText(
-				  inferParentFromEvidence(`${marketPulseData}\n${deepScrape}\n${registryData}\n${hqPulse.contextText || ''}`) ||
-					  ai.parent_company ||
-					  ai.legal_holding_company ||
-					  ai.product?.ultimate_parent ||
-					  ai.product?.parent ||
-					  ''
-			  );
+			!isUnresolved(offParentCompany)
+				? offParentCompany
+				: normalizeText(
+					publicVerification?.company ||
+					// Only accept an inferred parent when explicit evidence mentions the company
+					(() => {
+						const inferredCandidate = inferParentFromEvidence(finalEvidenceContext, parentAnchor);
+						if (inferredCandidate && companyValueHasEvidenceSupport(inferredCandidate, finalEvidenceContext, parentAnchor)) return inferredCandidate;
+						// fall back to AI-promoted parent only if AI's value is supported in snippets
+						if (
+							companyValueHasEvidenceSupport(
+								ai.parent_company || ai.legal_holding_company || ai.product?.ultimate_parent || ai.product?.parent || '',
+								finalEvidenceContext,
+								parentAnchor
+							)
+						) {
+							return normalizeCompanyName(ai.parent_company || ai.legal_holding_company || ai.product?.ultimate_parent || ai.product?.parent || '');
+						}
+						return '';
+					})() || ''
+				);
 
 	// Normalize final parent company into a clean, human-readable label
 	const finalParentCompany = normalizeCompanyName(finalParentCompanyRaw) || 'Unresolved Parent';
-	const finalParentHqCountry =
-		normalizeText(
-			inferHqCountryFromEvidence(`${hqPulse.contextText || marketPulseData}\n${deepScrape}\n${finalParentCompany}`) ||
-				ai.parent_hq_country ||
-				ai.holding_company_hq ||
-				ai.corporate_structure?.global_hq_country ||
-				''
-		) || 'Unresolved HQ Country';
+	const verifiedHqCountry =
+		publicVerification &&
+		(publicVerification.source === 'OfficialSite' || publicVerification.source === 'Registry') &&
+		!isUnresolved(publicVerification.hqCountry) &&
+		companyHasHqEvidence(finalParentCompany, `${finalEvidenceContext}\n${publicVerification.evidence}`, parentAnchor)
+			? publicVerification.hqCountry
+			: '';
+	// Only accept inferred HQ country when there is explicit snippet evidence linking the parent company to an HQ/country mention.
+	const inferredHqCandidate = inferHqCountryFromEvidence(`${finalEvidenceContext}\n${finalParentCompany}`, finalParentCompany || parentAnchor);
+	const inferredHqAccepted =
+		Boolean(finalParentCompany) &&
+		Boolean(inferredHqCandidate) &&
+		companyHasHqEvidence(finalParentCompany, `${finalEvidenceContext}\n${finalParentCompany}`, parentAnchor);
+	const finalParentHqCountry = normalizeText(verifiedHqCountry || (inferredHqAccepted ? inferredHqCandidate : '')) || 'Unresolved HQ Country';
 	const finalCategory =
 		!isUnresolved(offCategory)
 			? offCategory
 			: normalizeText(ai.category || ai.product_identity?.category || domainToCategory(detectLikelyDomain(`${offContext}\n${marketPulseData}\n${deepScrape}`))) ||
 				'Unresolved Category';
+
+	if (publicVerification?.company && isStrongCompanyCandidate(publicVerification.company)) {
+		ai.parent_company = normalizeCompanyName(publicVerification.company) || ai.parent_company;
+		ai.legal_holding_company = normalizeCompanyName(publicVerification.company) || ai.legal_holding_company;
+	}
+	if (publicVerification?.hqCountry && !isUnresolved(publicVerification.hqCountry)) {
+		ai.parent_hq_country = publicVerification.hqCountry;
+		ai.holding_company_hq = publicVerification.hqCountry;
+	}
 
 	ai.origin_country = finalOriginCountry;
 	ai.country_of_origin = finalOriginCountry;
@@ -2298,23 +4124,9 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 
 	console.log(`⚖️ [ARBITRATION] product=${ai.product.name} brand=${ai.product.brand} parent=${ai.product.ultimate_parent}`);
 
-	const pickMeaningfulProductName = (...candidates: Array<string | undefined | null>) => {
-		for (const candidate of candidates) {
-			const normalized = normalizeText(candidate);
-			if (normalized && !isUnresolved(normalized)) return normalized;
-		}
-		return 'UNKNOWN';
-	};
-
 	const dbPayload = {
 		barcode: ai.barcode,
-		brand: pickMeaningfulProductName(
-			ai.product_identity?.verified_name,
-			ai.product?.name,
-			ai.product_name,
-			ai.brand,
-			ai.product?.brand
-		),
+		brand: normalizeText(ai.brand || ai.product?.brand || ai.product_identity?.brand || ai.verified_brand) || 'UNKNOWN',
 		parent_company: normalizeText(ai.parent_company || ai.legal_holding_company) || 'UNKNOWN',
 		origin_country: normalizeText(ai.origin_country || ai.country_of_origin) || 'UNKNOWN',
 		category: normalizeText(ai.category || ai.product_identity?.category) || 'UNKNOWN',
@@ -2331,16 +4143,99 @@ async function robustScan(barcode: string): Promise<OpenRouterCorporateOutput> {
 
 export const POST: RequestHandler = async ({ request }) => {
 	const headers = corsHeaders(request.headers.get('origin'));
+	const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || request.headers.get('x-real-ip') || 'unknown';
+
+	if (!checkRateLimit(ip)) {
+		return json({ error: 'Too many requests. Please try again later.' }, { status: 429, headers });
+	}
 
 	try {
 		const body = (await request.json().catch(() => ({}))) as VerifyBody;
 		const barcode = body.barcode?.trim();
+		const cameraInput: ScanEvidenceInput = {
+			ocr_text: body.ocr_text,
+			image_data_url: body.image_data_url,
+			image_base64: body.image_base64,
+			image_url: body.image_url
+		};
+		const cameraEvidence = await resolveCameraEvidence(cameraInput).catch(() => ({ ocrText: '', source: null, prompt: '' }));
+		const hasCameraEvidence = Boolean(cameraEvidence.ocrText || cameraInput.ocr_text || cameraInput.image_data_url || cameraInput.image_base64 || cameraInput.image_url);
 
-		if (!barcode) {
-			return json({ error: 'barcode is required' }, { status: 400, headers });
+		if (!barcode && !hasCameraEvidence) {
+			return json({ error: 'Provide a barcode or a camera image to scan.' }, { status: 400, headers });
 		}
 
-		const result = await robustScan(barcode);
+		const barcodeValidation = barcode ? validateBarcode(barcode) : { valid: false, type: 'unknown' as const, digits: '', error: 'No barcode provided' };
+		if (barcode && !barcodeValidation.valid && !hasCameraEvidence) {
+			return json(
+				{
+					error: barcodeValidation.error || `Invalid barcode: ${barcodeValidation.type}`,
+					barcode_validation: barcodeValidation
+				},
+				{ status: 400, headers }
+			);
+		}
+
+		let userId: string | null = null;
+		const authHeader = request.headers.get('authorization') || '';
+		if (authHeader.startsWith('Bearer ')) {
+			const token = authHeader.slice(7).trim();
+			if (token) {
+				try {
+					const adminSupabase = getAdminSupabase() as unknown as {
+						auth: {
+							getUser: (jwt: string) => Promise<{ data: { user: { id: string } | null }; error: unknown }>;
+						};
+					};
+					const { data } = await adminSupabase.auth.getUser(token);
+					userId = data.user?.id || null;
+				} catch {
+					userId = null;
+				}
+			}
+		}
+
+		if (userId) {
+			const quota = await checkAndDecrementQuota(userId);
+			if (!quota.allowed) {
+				return json(
+					{ error: quota.reason || 'Scan quota exceeded.', quota: { plan: quota.plan, scansRemaining: quota.scansRemaining } },
+					{ status: 402, headers }
+				);
+			}
+		}
+
+		const result = await withTimeout(
+			robustScan(barcode || '', cameraInput),
+			20_000,
+			{
+				...fallbackCorporateResult(barcode || cameraEvidence.ocrText || 'camera'),
+				error: 'Scan timed out. Please try again.',
+				arbitration_log: 'Hard timeout reached in POST handler.'
+			} as OpenRouterCorporateOutput
+		);
+
+		const needsCameraFallback =
+			Boolean(cameraEvidence.prompt) ||
+			isUnresolved(result.parent_company) ||
+			isUnresolved(result.parent_hq_country) ||
+			isUnresolved(result.brand) ||
+			(result.confidence_score || result.product?.confidence || 0) < 0.72;
+
+		if (needsCameraFallback) {
+			const resultPayload = result as Record<string, unknown>;
+			resultPayload.scan_guidance = {
+				next_step: 'camera_ocr',
+				message:
+					cameraEvidence.prompt ||
+					'Point the camera at the product label so OCR and AI can extract the remaining fields.'
+			};
+		}
+
+		if (userId) {
+			saveScanHistory(userId, barcode || result.barcode, result).catch(() => null);
+		}
+
 		return json(result, { headers });
 	} catch (error) {
 		const message = error instanceof Error ? error.message : 'Internal server error';
