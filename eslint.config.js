@@ -37,8 +37,11 @@ export default defineConfig(
 		}
 	},
 	{
-		// Override or add rule settings here, such as:
-		// 'svelte/button-has-type': 'error'
-		rules: {}
+		// Server-side rules: disallow console.* except inside the logger implementation
+		files: ['src/lib/server/**', 'src/routes/api/**'],
+		excludedFiles: ['src/lib/server/logger.ts'],
+		rules: {
+			'no-console': 'error'
+		}
 	}
 );

@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { App } from "@capacitor/app";
   import VerificationCard from "$lib/components/VerificationCard.svelte";
-  import { verifyScan } from "$lib/supabase";
+  import { signInWithGoogle, verifyScan } from "$lib/supabase";
   import type { VerificationResult } from "$lib/verification";
 
   type ScanGuidance = NonNullable<VerificationResult["scan_guidance"]>;
@@ -12,6 +12,8 @@
   let guidance = $state<ScanGuidance | null>(null);
   let currentAction = $state<"idle" | "checking" | "camera">("idle");
   let errorMessage = $state<string | null>(null);
+  let authMessage = $state<string | null>(null);
+  let authBusy = $state(false);
   let cameraInput: HTMLInputElement | null = null;
 
   onMount(() => {
@@ -93,6 +95,22 @@
     currentAction = "idle";
     errorMessage = null;
   };
+
+  const startGoogleSignIn = async () => {
+    authBusy = true;
+    authMessage = null;
+
+    try {
+      const { error } = await signInWithGoogle();
+      if (error) {
+        authMessage = error.message;
+      }
+    } catch (error) {
+      authMessage = error instanceof Error ? error.message : "Unable to start Google sign-in.";
+    } finally {
+      authBusy = false;
+    }
+  };
 </script>
 
 <main class="relative flex h-full min-h-0 w-full flex-col overflow-x-hidden overflow-y-auto px-4 py-5 text-slate-100">
@@ -107,6 +125,25 @@
         Live OCR
       </div>
     </header>
+
+    <section class="anim-in-1 rounded-3xl border border-sky-300/15 bg-slate-950/60 p-4 backdrop-blur">
+      <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <p class="text-[11px] uppercase tracking-[0.24em] text-sky-200/65">Sign in</p>
+          <p class="mt-1 text-sm leading-relaxed text-slate-300">Use Google to sign in with Supabase Auth and keep your session across scans.</p>
+        </div>
+        <button
+          class="rounded-xl bg-white px-4 py-3 text-sm font-semibold text-slate-950 transition duration-200 ease-out hover:-translate-y-px hover:bg-slate-200 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60"
+          onclick={startGoogleSignIn}
+          disabled={authBusy}
+        >
+          {authBusy ? "Connecting..." : "Continue with Google"}
+        </button>
+      </div>
+      {#if authMessage}
+        <p class="mt-3 text-sm text-rose-200">{authMessage}</p>
+      {/if}
+    </section>
 
     <section class="relative overflow-hidden rounded-[1.75rem] border border-sky-300/15 bg-slate-950/70 p-5 shadow-[0_24px_80px_rgba(2,6,23,0.45)] backdrop-blur anim-in-1">
       <div class="absolute inset-x-0 top-0 h-px bg-linear-to-r from-transparent via-sky-300/70 to-transparent"></div>

@@ -2,8 +2,11 @@ import { json } from '@sveltejs/kit';
 import { env as dynamicEnv } from '$env/dynamic/private';
 import { OPENROUTER_API_KEY, SEARCH_API_KEY } from '$env/static/private';
 import * as cheerio from 'cheerio';
+import { randomUUID } from 'node:crypto';
 import type { RequestHandler } from './$types';
 import { getAdminSupabase } from '$lib/server/supabase';
+import { verifyJwt } from '$lib/server/auth';
+import { createServerLogger } from '$lib/server/logger';
 
 type VerifyBody = {
 	barcode?: string;
@@ -448,6 +451,71 @@ const JITTER_MIN_MS = 200;
 const JITTER_MAX_MS = 600;
 const JITTER_GOOGLE_MIN_MS = 1500;
 const JITTER_GOOGLE_MAX_MS = 2500;
+const SCAN_DEBUG_LOGS = (dynamicEnv.SCAN_DEBUG_LOGS || '').toLowerCase() === 'true';
+const LOG_VALUE_PREVIEW_LENGTH = 160;
+
+function sanitizeLogArg(arg: unknown): unknown {
+	if (arg instanceof Error) {
+		return { name: arg.name, message: arg.message };
+	}
+
+	if (typeof arg === 'string') {
+		return arg.length > LOG_VALUE_PREVIEW_LENGTH
+			? `${arg.slice(0, LOG_VALUE_PREVIEW_LENGTH)}...[truncated]`
+			: arg;
+	}
+
+	if (arg && typeof arg === 'object') {
+		try {
+			const text = JSON.stringify(arg);
+			if (!text) return '[object]';
+			return text.length > LOG_VALUE_PREVIEW_LENGTH
+				? `${text.slice(0, LOG_VALUE_PREVIEW_LENGTH)}...[truncated]`
+				: text;
+		} catch {
+			return '[object_unserializable]';
+		}
+	}
+
+	return arg;
+}
+
+function scanDebugLog(message: string, ...args: unknown[]) {
+	if (!SCAN_DEBUG_LOGS) return;
+	const logger = createServerLogger('api.scan');
+	if (args.length === 0) {
+		logger.info(message);
+		return;
+	}
+	const safeArgs = args.map(sanitizeLogArg);
+	logger.info(message, { details: { args: safeArgs } });
+}
+
+function scanWarnLog(message: string, ...args: unknown[]) {
+	const logger = createServerLogger('api.scan');
+	if (args.length === 0) {
+		logger.warn(message);
+		return;
+	}
+	const safeArgs = args.map(sanitizeLogArg);
+	logger.warn(message, { details: { args: safeArgs } });
+}
+
+function scanErrorLog(message: string, ...args: unknown[]) {
+	const logger = createServerLogger('api.scan');
+	if (args.length === 0) {
+		logger.error(message, undefined);
+		return;
+	}
+	// If first arg is an Error, pass it to Sentry via logger.error
+	const [first, ...rest] = args;
+	const safeArgs = rest.map(sanitizeLogArg);
+	if (first instanceof Error) {
+		logger.error(message, first, { details: { args: safeArgs } });
+	} else {
+		logger.error(message, undefined, { details: { args: [sanitizeLogArg(first), ...safeArgs] } });
+	}
+}
 
 const GS1_PREFIX_MAP: Array<[string | [number, number], string]> = [
 	[[0, 19], 'United States'],
@@ -959,6 +1027,7 @@ async function lookupAuthorityRegistryCompany(subject: string): Promise<PublicVe
 async function extractOcrTextFromImageSource(imageSource: string): Promise<string> {
 	const cleanedSource = normalizeText(imageSource).replace(/\s+/g, '');
 	if (!cleanedSource) return '';
+	if (/^https?:\/\//i.test(cleanedSource)) return '';
 
 	const dataUrl = /^https?:\/\//i.test(cleanedSource) || /^data:/i.test(cleanedSource)
 		? cleanedSource
@@ -969,15 +1038,20 @@ async function extractOcrTextFromImageSource(imageSource: string): Promise<strin
 
 	const bytes = Buffer.from(await response.arrayBuffer());
 	const { createWorker } = await import('tesseract.js');
-	const worker = await createWorker('eng', 1, {
-		logger: () => undefined
-	});
+	const worker = await createWorker({ logger: () => undefined });
 
 	try {
+		await worker.load();
+		await worker.loadLanguage('eng');
+		await worker.initialize('eng');
 		const result = await worker.recognize(bytes);
-		return normalizeOcrText(result.data.text || '');
+		return normalizeOcrText(result?.data?.text || '');
 	} finally {
-		await worker.terminate();
+		try {
+			await worker.terminate();
+		} catch {
+			// ignore termination errors
+		}
 	}
 }
 
@@ -1486,7 +1560,7 @@ async function runSupplementalCorporateSearch(subject: string, barcode: string) 
 		`${cleanedSubject} country of origin`,
 		`${cleanedSubject} made in`
 	];
-	console.log(`🔎 [SUPPLEMENTAL_SEARCH] barcode=${barcode} subject=${cleanedSubject}`);
+	scanDebugLog(`🔎 [SUPPLEMENTAL_SEARCH] barcode=${barcode} subject=${cleanedSubject}`);
 
 	const results = (await Promise.all(
 		queries.map((query) =>
@@ -1496,7 +1570,7 @@ async function runSupplementalCorporateSearch(subject: string, barcode: string) 
 
 	const mergedContext = results.map((result) => result.compactContext || result.contextText || '').filter(Boolean).join('\n');
 	if (mergedContext) {
-		console.log(`📡 [SUPPLEMENTAL_SEARCH] snippets=${results.reduce((sum, result) => sum + (result.snippetCount || 0), 0)}`);
+		scanDebugLog(`📡 [SUPPLEMENTAL_SEARCH] snippets=${results.reduce((sum, result) => sum + (result.snippetCount || 0), 0)}`);
 	}
 
 	return { contextText: mergedContext, queries };
@@ -1629,13 +1703,13 @@ async function probeOfficialSite(websiteUrl: string, anchor?: string): Promise<P
 async function runPublicVerificationPass(subject: string, websiteHint?: string) {
 	const wikidata = await lookupWikidataCompany(subject);
 	if (wikidata) {
-		console.log(`🛰️ [PUBLIC_VERIFY] Wikidata company=${wikidata.company} hq=${wikidata.hqCountry}`);
+		scanDebugLog(`🛰️ [PUBLIC_VERIFY] Wikidata company=${wikidata.company} hq=${wikidata.hqCountry}`);
 		if (!isUnresolved(wikidata.hqCountry) && !isUnresolved(wikidata.company)) return wikidata;
 	}
 
 	const registry = await lookupAuthorityRegistryCompany(subject);
 	if (registry) {
-		console.log(`🏛️ [PUBLIC_VERIFY] Registry company=${registry.company} hq=${registry.hqCountry}`);
+		scanDebugLog(`🏛️ [PUBLIC_VERIFY] Registry company=${registry.company} hq=${registry.hqCountry}`);
 		if (!isUnresolved(registry.hqCountry) && !isUnresolved(registry.company)) return registry;
 	}
 
@@ -1643,7 +1717,7 @@ async function runPublicVerificationPass(subject: string, websiteHint?: string) 
 	if (website) {
 		const official = await probeOfficialSite(website, subject);
 		if (official) {
-			console.log(`🔎 [PUBLIC_VERIFY] OfficialSite company=${official.company} hq=${official.hqCountry}`);
+			scanDebugLog(`🔎 [PUBLIC_VERIFY] OfficialSite company=${official.company} hq=${official.hqCountry}`);
 			return official;
 		}
 	}
@@ -1651,10 +1725,10 @@ async function runPublicVerificationPass(subject: string, websiteHint?: string) 
 	const guessedCandidates = buildOfficialSiteCandidates(subject, website, wikidata?.website || '');
 	for (const candidate of guessedCandidates) {
 		if (!candidate || candidate === website) continue;
-		console.log(`🔎 [PUBLIC_VERIFY] Guessing official site candidate=${candidate}`);
+		scanDebugLog(`🔎 [PUBLIC_VERIFY] Guessing official site candidate=${candidate}`);
 		const official = await probeOfficialSite(candidate, subject);
 		if (official) {
-			console.log(`🔎 [PUBLIC_VERIFY] OfficialSite guess hit company=${official.company} hq=${official.hqCountry}`);
+			scanDebugLog(`🔎 [PUBLIC_VERIFY] OfficialSite guess hit company=${official.company} hq=${official.hqCountry}`);
 			return official;
 		}
 	}
@@ -1717,14 +1791,14 @@ function parseOffBrandDeep(product: OpenFoodFactsProduct | null) {
 		.find(Boolean);
 	if (fromBrands) {
 		const canonical = canonicalizeBrand(fromBrands);
-		console.log(`📦 [PARSED] OFF nested brand source=brands value=${canonical}`);
+		scanDebugLog(`📦 [PARSED] OFF nested brand source=brands value=${canonical}`);
 		return { brand: canonical, source: 'brands', parsed: true };
 	}
 
 	const fromManufacturer = normalizeText(product.manufacturer_name);
 	if (fromManufacturer) {
 		const canonical = canonicalizeBrand(fromManufacturer);
-		console.log(`📦 [PARSED] OFF nested brand source=manufacturer_name value=${canonical}`);
+		scanDebugLog(`📦 [PARSED] OFF nested brand source=manufacturer_name value=${canonical}`);
 		return { brand: canonical, source: 'manufacturer_name', parsed: true };
 	}
 
@@ -1739,21 +1813,21 @@ function parseOffBrandDeep(product: OpenFoodFactsProduct | null) {
 		.find(Boolean);
 	if (fromTags) {
 		const canonical = canonicalizeBrand(fromTags);
-		console.log(`📦 [PARSED] OFF nested brand source=brands_tags value=${canonical}`);
+		scanDebugLog(`📦 [PARSED] OFF nested brand source=brands_tags value=${canonical}`);
 		return { brand: canonical, source: 'brands_tags', parsed: true };
 	}
 
 	const fromOwnerName = normalizeText(product.owner_name);
 	if (fromOwnerName) {
 		const canonical = canonicalizeBrand(fromOwnerName);
-		console.log(`📦 [PARSED] OFF nested brand source=owner_name value=${canonical}`);
+		scanDebugLog(`📦 [PARSED] OFF nested brand source=owner_name value=${canonical}`);
 		return { brand: canonical, source: 'owner_name', parsed: true };
 	}
 
 	const fromOwner = normalizeText(product.owner);
 	if (fromOwner) {
 		const canonical = canonicalizeBrand(fromOwner);
-		console.log(`📦 [PARSED] OFF nested brand source=owner value=${canonical}`);
+		scanDebugLog(`📦 [PARSED] OFF nested brand source=owner value=${canonical}`);
 		return { brand: canonical, source: 'owner', parsed: true };
 	}
 
@@ -1846,7 +1920,7 @@ function buildEvidenceBundle(args: {
 function buildScrapeHeaders() {
 	const randomizedUserAgent = randomItem(STEALTH_USER_AGENTS);
 	const fingerprint = resolveFingerprintProfile(randomizedUserAgent);
-	console.log(
+	scanDebugLog(
 		`🕵️ [FINGERPRINT] Showing matched headers. UA=${randomizedUserAgent} Sec-CH-UA=${fingerprint.secChUa} Sec-CH-UA-Platform=${fingerprint.platform}`
 	);
 	return {
@@ -1900,7 +1974,7 @@ function summarizeSerperPayload(payload: SerperPayload) {
 async function serperSearch(query: string) {
 	const apiKey = dynamicEnv.SEARCH_API_KEY || SEARCH_API_KEY;
 	if (!apiKey) {
-		console.warn('⚠️ Serper API key missing at runtime (dynamicEnv and static).');
+		scanWarnLog('⚠️ Serper API key missing at runtime (dynamicEnv and static).');
 		return { query, contextText: '', statusCode: 0, used: false, snippetCount: 0 };
 	}
 
@@ -1916,7 +1990,7 @@ async function serperSearch(query: string) {
 	});
 
 	if (!response.ok) {
-		console.warn(`📡 [SERPER] ${query} -> status ${response.status}`);
+		scanWarnLog(`📡 [SERPER] ${query} -> status ${response.status}`);
 		return { query, contextText: '', statusCode: response.status, used: false, snippetCount: 0 };
 	}
 
@@ -1929,7 +2003,7 @@ async function serperSearch(query: string) {
 		.join(' | ');
 	const snippetCount = payload.organic?.length ?? 0;
 	if (snippetCount > 0) {
-		console.log(`📡 [SERPER] query=${query} snippets=${snippetCount} chars=${contextText.length}`);
+		scanDebugLog(`📡 [SERPER] query=${query} snippets=${snippetCount} chars=${contextText.length}`);
 	}
 	return {
 		query,
@@ -1964,7 +2038,7 @@ async function serperPrimarySearchWithRetry(barcode: string): Promise<SerperPrim
 
 	// Strengthened retry: use an explicit product-brand-manufacturer query when primary returns 0 snippets
 	const retryQuery = `product brand manufacturer for barcode ${barcode}`;
-	console.log(`🔁 [RETRY] 0 snippets on primary query; retrying with "${retryQuery}".`);
+	scanDebugLog(`🔁 [RETRY] 0 snippets on primary query; retrying with "${retryQuery}".`);
 	const retry = await serperSearch(retryQuery).catch(() => ({
 		query: retryQuery,
 		contextText: '',
@@ -1988,15 +2062,15 @@ async function serperPrimarySearchWithRetry(barcode: string): Promise<SerperPrim
 	// Diagnostic logging: when both primary and retry are empty, persist raw Serper responses for debugging
 	if ((primary.snippetCount ?? 0) === 0 && (retry.snippetCount ?? 0) === 0) {
 		try {
-			console.log('🔍 [SERPER_RAW] primary response (empty):', JSON.stringify(primary));
-			console.log('🔍 [SERPER_RAW] retry response (empty):', JSON.stringify(retry));
+			scanDebugLog('🔍 [SERPER_RAW] primary response (empty):', JSON.stringify(primary));
+			scanDebugLog('🔍 [SERPER_RAW] retry response (empty):', JSON.stringify(retry));
 		} catch {
-			console.log('🔍 [SERPER_RAW] primary/retry response (could not stringify)');
+			scanDebugLog('🔍 [SERPER_RAW] primary/retry response (could not stringify)');
 		}
 	}
 
 	const fallbackQuery = `"${barcode}" product name brand manufacturer`;
-	console.log(`🔁 [RETRY] Secondary empty-market search with "${fallbackQuery}".`);
+	scanDebugLog(`🔁 [RETRY] Secondary empty-market search with "${fallbackQuery}".`);
 	const fallback = await serperSearch(fallbackQuery).catch(() => ({
 		query: fallbackQuery,
 		contextText: '',
@@ -2008,9 +2082,9 @@ async function serperPrimarySearchWithRetry(barcode: string): Promise<SerperPrim
 	// If fallback also returned empty, log the raw fallback response for diagnostics
 	if ((fallback.snippetCount ?? 0) === 0) {
 		try {
-			console.log('🔍 [SERPER_RAW] fallback response (empty):', JSON.stringify(fallback));
+			scanDebugLog('🔍 [SERPER_RAW] fallback response (empty):', JSON.stringify(fallback));
 		} catch {
-			console.log('🔍 [SERPER_RAW] fallback response (empty; could not stringify)');
+			scanDebugLog('🔍 [SERPER_RAW] fallback response (empty; could not stringify)');
 		}
 	}
 
@@ -2044,7 +2118,7 @@ async function performSerperHardSearch(barcode: string, offProduct: OpenFoodFact
 
 	// Log Serper telemetry only when organic snippets present
 	results.forEach((r, idx) => {
-		if ((r.snippetCount ?? 0) > 0) console.log(`📡 [SERPER] HardSearch query=${queries[idx]} snippets=${r.snippetCount}`);
+		if ((r.snippetCount ?? 0) > 0) scanDebugLog(`📡 [SERPER] HardSearch query=${queries[idx]} snippets=${r.snippetCount}`);
 	});
 
 	// Merge contexts into a compact organic stream: title + snippet joined by " | "
@@ -2302,8 +2376,8 @@ async function semanticGoogleScrape(barcode: string) {
 	});
 
 	const html = await response.text();
-	console.log(`[verify] google_status=${response.status}`);
-	console.log(`[verify] google_head=${html.slice(0, 200).replace(/\s+/g, ' ')}`);
+	scanDebugLog(`[verify] google_status=${response.status}`);
+	scanDebugLog(`[verify] google_head=${html.slice(0, 200).replace(/\s+/g, ' ')}`);
 
 	const $ = cheerio.load(html);
 
@@ -2674,10 +2748,10 @@ ${args.evidenceBundle || 'EMPTY_EVIDENCE_BUNDLE'}
 </evidence_bundle>
 ${args.truthBundleBlock}`;
 
-	console.log(
+	scanDebugLog(
 		`🚀 OpenRouter Sent: barcode=${args.barcode} model=${OPENROUTER_MODEL} marketChars=${args.searchContext.length} deepScrapeChars=${args.deepScrape.length}`
 	);
-	console.log(`🛰️ [DATA_DENSITY] marketPulseChars=${args.searchContext.length} deepScrapeChars=${args.deepScrape.length}`);
+	scanDebugLog(`🛰️ [DATA_DENSITY] marketPulseChars=${args.searchContext.length} deepScrapeChars=${args.deepScrape.length}`);
 
 	const response = await fetch(OPENROUTER_API_URL, {
 		method: 'POST',
@@ -2976,7 +3050,7 @@ ${args.truthBundleBlock}`;
 			reasoning: flagReason
 		};
 	} catch (e) {
-		console.error(`🚨 [SCHEMA_FAIL] Failed to parse OpenRouter content for ${args.barcode}. RawStart=${String(content).slice(0,200)}`, e);
+		scanErrorLog(`🚨 [SCHEMA_FAIL] Failed to parse OpenRouter content for ${args.barcode}. RawStart=${String(content).slice(0,200)}`, e);
 		const fallback = buildEvidenceDrivenFallback(args, 'OpenRouter JSON parse fallback');
 		return {
 			...fallback,
@@ -3000,7 +3074,7 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 		.maybeSingle();
 
 	if (error) {
-		console.warn('[verify] extended cache select failed, falling back to base columns', error);
+		scanWarnLog('[verify] extended cache select failed, falling back to base columns', error);
 		const fallback = await adminSupabase
 			.from('products')
 			.select(baseSelect)
@@ -3011,7 +3085,7 @@ async function loadCachedProduct(barcode: string): Promise<OpenRouterCorporateOu
 	}
 
 	if (error) {
-		console.error('[verify] cache select failed', error);
+		scanErrorLog('[verify] cache select failed', error);
 		return null;
 	}
 
@@ -3225,12 +3299,12 @@ async function cacheScanResult(result: {
 		is_flagged: Boolean(result.is_flagged)
 	};
 
-	console.log('🛰️ [DB_PAYLOAD]', JSON.stringify(payload));
+	scanDebugLog('🛰️ [DB_PAYLOAD]', JSON.stringify(payload));
 
 	const { error } = await adminSupabase.from('products').upsert(payload, { onConflict: 'barcode' });
 
 	if (error) {
-		console.error('[verify] cache upsert failed', error);
+		scanErrorLog('[verify] cache upsert failed', error);
 		throw new Error('Failed to persist verification result to products cache.');
 	}
 }
@@ -3268,7 +3342,7 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 			cachedBrandLooksLikeProduct ||
 			cachedLooksStale
 		) {
-			console.log(`⚠️ [CACHE] Bypassing stale unresolved cache for ${barcode} so live evidence can re-run.`);
+			scanDebugLog(`⚠️ [CACHE] Bypassing stale unresolved cache for ${barcode} so live evidence can re-run.`);
 		} else {
 		cached.forensic_report = {
 			scraper_blocked: false,
@@ -3289,8 +3363,8 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 
 	const barcodeValidation = validateBarcode(barcode);
 	const gs1RegistrationCountry = barcodeValidation.gs1Country || lookupGs1Country(barcode);
-	console.log(`🔢 [BARCODE] type=${barcodeValidation.type} valid=${barcodeValidation.valid} gs1=${gs1RegistrationCountry}`);
-	if (cameraEvidence.prompt) console.log(`📷 [CAMERA] ${cameraEvidence.prompt}`);
+	scanDebugLog(`🔢 [BARCODE] type=${barcodeValidation.type} valid=${barcodeValidation.valid} gs1=${gs1RegistrationCountry}`);
+	if (cameraEvidence.prompt) scanDebugLog(`📷 [CAMERA] ${cameraEvidence.prompt}`);
 	const cameraIdentity = cameraEvidence.ocrText
 		? extractProductIdentityFromEvidence(cameraEvidence.ocrText, cameraEvidence.ocrText, cameraEvidence.ocrText, cameraEvidence.ocrText)
 		: {};
@@ -3323,7 +3397,7 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 	const cameraOnlyMode = cameraInputProvided && !normalizeText(barcode);
 
 	if (cameraOnlyMode) {
-		console.log('📷 [CAMERA_ONLY] Running camera-first scan without a valid barcode.');
+		scanDebugLog('📷 [CAMERA_ONLY] Running camera-first scan without a valid barcode.');
 		const cameraSubject = cameraBrandFromOcr || cameraProductName || normalizeText(cameraEvidence.ocrText.split(/\r?\n/)[0] || '') || 'Camera Product';
 		const cameraSearch = await serperPrimarySearchWithRetry(cameraSubject).catch(() => ({
 			result: { query: cameraSubject, contextText: '', statusCode: 0, used: false, snippetCount: 0 },
@@ -3452,7 +3526,7 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 		null
 	);
 	if (publicVerification) {
-		console.log(`🛰️ [PUBLIC_VERIFY] source=${publicVerification.source} company=${publicVerification.company} hq=${publicVerification.hqCountry}`);
+		scanDebugLog(`🛰️ [PUBLIC_VERIFY] source=${publicVerification.source} company=${publicVerification.company} hq=${publicVerification.hqCountry}`);
 	}
 	let offContext = offProduct ? buildOpenFoodFactsContext(offProduct) : '';
 	if (upcItemDBResult && !offProduct) {
@@ -3499,11 +3573,11 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 		hqPulse: '',
 		truthBundleBlock: offContext
 	});
-	console.log(`📥 [OFF] Status: ${offLookup.statusCode}`);
+	scanDebugLog(`📥 [OFF] Status: ${offLookup.statusCode}`);
 
 	// If OFF is missing/404 or Serper returned no snippets, run hard compensation searches
 	if ((!offLookup.product || offLookup.statusCode === 404) && (marketPulse.snippetCount ?? 0) === 0) {
-		console.log('⚠️ [EMPTY_REGISTRY] OFF missing or 404; triggering full compensation Serper hard-search.');
+		scanDebugLog('⚠️ [EMPTY_REGISTRY] OFF missing or 404; triggering full compensation Serper hard-search.');
 		const hard = await performSerperHardSearch(barcode, offLookup.product).catch(() => ({ queries: [], results: [], mergedContext: '' }));
 		if (hard && hard.mergedContext) {
 			// assign merged context and sum snippet counts
@@ -3515,14 +3589,14 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 	}
 	const serperFallbackActive = scrape.statusCode === 429;
 	if (serperFallbackActive) {
-		console.log(
+		scanDebugLog(
 			'🚨 [Block Alert] 429 detected on deep scrape; silently promoting Serper as primary truth source.'
 		);
 	}
 	if ((marketPulse.snippetCount ?? 0) > 0) {
-		console.log(`📡 [SERPER] Snippets used: primary=${marketPulse.snippetCount ?? 0}`);
+		scanDebugLog(`📡 [SERPER] Snippets used: primary=${marketPulse.snippetCount ?? 0}`);
 	} else {
-		console.log('⚠️ Empty Search (No Credits): primary market pulse returned 0 snippets');
+		scanDebugLog('⚠️ Empty Search (No Credits): primary market pulse returned 0 snippets');
 	}
 
 	const offDomain = detectLikelyDomain(offContext);
@@ -3552,14 +3626,14 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 		snippetCount: 0
 	}));
 	if ((corporateCrawl.snippetCount ?? 0) > 0) {
-		console.log(
+		scanDebugLog(
 			`📡 [SERPER] Snippets used: primary=${marketPulse.snippetCount ?? 0} ownership=${corporateCrawl.snippetCount ?? 0}`
 		);
 	} else {
-		console.log('⚠️ Empty Search (No Credits): ownership crawl returned 0 snippets');
+		scanDebugLog('⚠️ Empty Search (No Credits): ownership crawl returned 0 snippets');
 	}
 	if (marketPulseSearch.retried) {
-		console.log(
+		scanDebugLog(
 			`🔁 [SERPER] Retry completed. first_attempt=${marketPulseSearch.firstAttemptSnippets} final=${marketPulse.snippetCount ?? 0}`
 		);
 	}
@@ -3583,13 +3657,13 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 	// Keep the broader cleanup variant too for consistency with earlier scan telemetry.
 	searchContext = searchContext.replace(/About these results|More results|Feedback|Privacy|Terms/gi, '');
 	// Log cleaned context size and preview for auditing (mandated V81)
-	console.log('🛰️ [DATA_LOAD]', searchContext.length);
-	console.log('📝 [CLEAN_CONTEXT]', searchContext.substring(0, 200));
+	scanDebugLog('🛰️ [DATA_LOAD]', searchContext.length);
+	scanDebugLog('📝 [CLEAN_CONTEXT]', searchContext.substring(0, 200));
 	// Per TITAN_FORGE_V45_FINAL: pass the full consolidated evidence stream
 	const marketPulseForModel = normalizeText(searchContext).slice(0, 4000);
 
-	console.log(`🔍 [DEBUG] corporateCrawl.contextText.length=${corporateCrawl.contextText?.length || 0}`);
-	console.log(`🔍 [DEBUG] scrape.contextText.length=${scrape.contextText?.length || 0}`);
+	scanDebugLog(`🔍 [DEBUG] corporateCrawl.contextText.length=${corporateCrawl.contextText?.length || 0}`);
+	scanDebugLog(`🔍 [DEBUG] scrape.contextText.length=${scrape.contextText?.length || 0}`);
 
 	let deepScrape = 'NO_DEEP_SCRAPE_DATA';
 	if (corporateCrawl.contextText && corporateCrawl.contextText.length > 50) {
@@ -3601,20 +3675,20 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 		deepScrape = corporateCrawl.contextText;
 	}
 
-	console.log(`🔍 [DEBUG] deepScrape final length=${deepScrape.length} first100chars=${deepScrape.slice(0, 100)}`);
+	scanDebugLog(`🔍 [DEBUG] deepScrape final length=${deepScrape.length} first100chars=${deepScrape.slice(0, 100)}`);
 
 	const corporateSignalFromSearch = containsManufacturerSignals(`${searchContext}\n${deepScrape}`);
 	const serperPromotedPrimary = serperFallbackActive || !offContext;
 	if (serperPromotedPrimary && (marketPulse.snippetCount ?? 0) > 0) {
-		console.log('📡 [SERPER] Promoted as Primary Truth to resolve unresolved OFF fields.');
+		scanDebugLog('📡 [SERPER] Promoted as Primary Truth to resolve unresolved OFF fields.');
 	}
-	console.log(`🛰️ [DATA_DENSITY] marketPulseChars=${marketPulseForModel.length} deepScrapeChars=${deepScrape.length}`);
-	console.log('🧬 [FUSION_INPUT]:', { hasOFF: !!offData, searchLength: searchContext.length });
+	scanDebugLog(`🛰️ [DATA_DENSITY] marketPulseChars=${marketPulseForModel.length} deepScrapeChars=${deepScrape.length}`);
+	scanDebugLog('🧬 [FUSION_INPUT]:', { hasOFF: !!offData, searchLength: searchContext.length });
 	const truthBundleBlock = `<truth_bundle>\n<off_evidence>\n${offContext || 'Source [OFF] failed; rely on remaining evidence.'}\n</off_evidence>\n<serper_evidence>\n${marketPulse.contextText || 'Source [Serper] failed; rely on remaining evidence.'}\n</serper_evidence>\n<scraper_evidence>\n${scrape.contextText || 'Source [Scraper] failed; rely on remaining evidence.'}\n</scraper_evidence>\n<ownership_crawl_evidence>\n${corporateCrawl.contextText || 'Source [Corporate_Crawl] failed; rely on remaining evidence.'}\n</ownership_crawl_evidence>\n</truth_bundle>`;
 
 	if (!offContext && !marketPulse.contextText && !scrape.contextText) {
 		const fallback = fallbackCorporateResult(barcode);
-		console.log('⚖️ Arbitration: missing registry and market evidence; returning manual-input required fallback.');
+		scanDebugLog('⚖️ Arbitration: missing registry and market evidence; returning manual-input required fallback.');
 		return {
 			...fallback,
 			forensic_report: {
@@ -3661,7 +3735,7 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 		: registryOverrideNote
 			? 'market_override_void_registry'
 			: 'registry_market_consistent';
-	console.log(`⚖️ [ARBITRATION] ${registryOverrideNote || 'Registry and market pulse did not trigger metadata-ghost void.'}`);
+	scanDebugLog(`⚖️ [ARBITRATION] ${registryOverrideNote || 'Registry and market pulse did not trigger metadata-ghost void.'}`);
 	const sourcesUsed: Array<'OFF_API' | 'Search_Scrape' | 'Internal_Knowledge'> = [];
 	if (offProduct) sourcesUsed.push('OFF_API');
 	if (scrape.hasContext || marketPulse.used || corporateCrawl.used) sourcesUsed.push('Search_Scrape');
@@ -3681,8 +3755,8 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 		snippetCount: 0
 	}));
 
-	console.log('🛰️ [DATA_LOAD]', marketPulseData.length);
-	console.log('📝 [CLEAN_PREVIEW]', marketPulseData.substring(0, 150));
+	scanDebugLog('🛰️ [DATA_LOAD]', marketPulseData.length);
+	scanDebugLog('📝 [CLEAN_PREVIEW]', marketPulseData.substring(0, 150));
 	const ai = await callOpenRouterAnalyzer({
 		barcode,
 		registryData,
@@ -3820,9 +3894,9 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 		applyVerificationToAi(ai, verified);
 
 		const perFieldSummary = perFieldProvenance.map((p) => ({ field: p.field, accepted: p.result.accepted, confidence: p.result.confidence }));
-		console.log(`🔐 [VERIFIER] overall_confidence=${verified.overall_confidence} per_field=${JSON.stringify(perFieldSummary)}`);
+		scanDebugLog(`🔐 [VERIFIER] overall_confidence=${verified.overall_confidence} per_field=${JSON.stringify(perFieldSummary)}`);
 	} catch (err) {
-		console.warn('🔐 [VERIFIER] verifier failed', err);
+		scanWarnLog('🔐 [VERIFIER] verifier failed', err);
 	}
 
 	// GEOPOLITICAL AUDIT: probe for Israeli operations / funding ties for the inferred parent
@@ -3843,8 +3917,8 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 				israeli_related: isIsraeli
 			};
 
-			if (isIsraeli) console.log(`⚖️ [AUDIT] Geopolitical audit flagged Israeli-related evidence for ${ultimateParent}`);
-			else console.log(`⚖️ [AUDIT] No Israeli-related evidence found for ${ultimateParent}`);
+			if (isIsraeli) scanDebugLog(`⚖️ [AUDIT] Geopolitical audit flagged Israeli-related evidence for ${ultimateParent}`);
+			else scanDebugLog(`⚖️ [AUDIT] No Israeli-related evidence found for ${ultimateParent}`);
 		}
 	} catch {
 		// non-fatal
@@ -4122,7 +4196,7 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 				: 'Strict arbitration used available Serper/Scraper/OFF streams without retry escalation.')
 	};
 
-	console.log(`⚖️ [ARBITRATION] product=${ai.product.name} brand=${ai.product.brand} parent=${ai.product.ultimate_parent}`);
+	scanDebugLog(`⚖️ [ARBITRATION] product=${ai.product.name} brand=${ai.product.brand} parent=${ai.product.ultimate_parent}`);
 
 	const dbPayload = {
 		barcode: ai.barcode,
@@ -4134,7 +4208,7 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 		is_flagged: Boolean(ai.is_flagged)
 	};
 
-	console.log('🛰️ [DB_PAYLOAD]', JSON.stringify(dbPayload));
+	scanDebugLog('🛰️ [DB_PAYLOAD]', JSON.stringify(dbPayload));
 
 	await cacheScanResult(dbPayload);
 
@@ -4144,51 +4218,130 @@ async function robustScan(barcode: string, cameraInput: ScanEvidenceInput = {}):
 export const POST: RequestHandler = async ({ request }) => {
 	const headers = corsHeaders(request.headers.get('origin'));
 	const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || request.headers.get('x-real-ip') || 'unknown';
+	const requestId = request.headers.get('x-request-id') || randomUUID();
+	const logger = createServerLogger('/api/scan', requestId);
+	const requestStartedAt = performance.now();
+	const stageTimings: Record<string, number> = {};
+	let finalStatus = 200;
+	let finalOutcome = 'ok';
+	let finalError: unknown = null;
 
+	const measureStage = async <T>(stage: string, action: () => Promise<T>): Promise<T> => {
+		const stageStartedAt = performance.now();
+		try {
+			return await action();
+		} finally {
+			stageTimings[stage] = Number((performance.now() - stageStartedAt).toFixed(2));
+		}
+	};
+
+	const respond = <T>(body: T, status: number, outcome: string) => {
+		finalStatus = status;
+		finalOutcome = outcome;
+		return json(body, { status, headers });
+	};
+
+	// Basic rate-limit by IP
 	if (!checkRateLimit(ip)) {
-		return json({ error: 'Too many requests. Please try again later.' }, { status: 429, headers });
+		return respond({ error: 'Too many requests. Please try again later.' }, 429, 'rate_limited');
 	}
 
 	try {
-		const body = (await request.json().catch(() => ({}))) as VerifyBody;
-		const barcode = body.barcode?.trim();
+		// Enforce JSON content-type for POST
+		const contentType = (request.headers.get('content-type') || '').toLowerCase();
+		if (!contentType.includes('application/json')) {
+			return respond({ error: 'Unsupported Media Type - use application/json' }, 415, 'invalid_content_type');
+		}
+
+		// Limit request body size to avoid DoS via huge payloads
+		const MAX_BODY_BYTES = 1_000_000; // 1 MB
+		const raw = await measureStage('request_text', () => request.text());
+		if (raw.length > MAX_BODY_BYTES) {
+			return respond({ error: 'Request body too large' }, 413, 'body_too_large');
+		}
+
+		let body: VerifyBody;
+		try {
+			body = JSON.parse(raw) as VerifyBody;
+		} catch {
+			return respond({ error: 'Invalid JSON body' }, 400, 'invalid_json');
+		}
+
+		// Enforce strict size limits on potentially large fields to avoid DoS
+		const MAX_IMAGE_BASE64_CHARS = 200_000; // ~150KB
+		const MAX_IMAGE_DATA_URL_CHARS = 250_000; // allow some overhead for "data:image/...;base64,"
+		const MAX_OCR_CHARS = 20_000;
+
+		if (typeof body.image_base64 === 'string' && body.image_base64.length > MAX_IMAGE_BASE64_CHARS) {
+			return respond({ error: 'Image payload too large' }, 413, 'image_payload_too_large');
+		}
+
+		if (typeof body.image_data_url === 'string' && body.image_data_url.length > MAX_IMAGE_DATA_URL_CHARS) {
+			return respond({ error: 'Image payload too large' }, 413, 'image_payload_too_large');
+		}
+
+		if (typeof body.ocr_text === 'string' && body.ocr_text.length > MAX_OCR_CHARS) {
+			return respond({ error: 'OCR text too large' }, 413, 'ocr_too_large');
+		}
+
+		if (typeof body.image_url === 'string' && /^https?:\/\//i.test(body.image_url.trim())) {
+			return respond(
+				{ error: 'Remote image URLs are not supported. Send a data URL or base64-encoded image instead.' },
+				400,
+				'unsupported_remote_image_url'
+			);
+		}
+		const barcode = typeof body.barcode === 'string' ? body.barcode.trim() : undefined;
+
+		// Validate optional action field
+		if (body.action && body.action !== 'scan') {
+			return respond({ error: 'Invalid action' }, 400, 'invalid_action');
+		}
 		const cameraInput: ScanEvidenceInput = {
 			ocr_text: body.ocr_text,
 			image_data_url: body.image_data_url,
 			image_base64: body.image_base64,
 			image_url: body.image_url
 		};
-		const cameraEvidence = await resolveCameraEvidence(cameraInput).catch(() => ({ ocrText: '', source: null, prompt: '' }));
+		const cameraEvidence = await measureStage('camera_evidence', () =>
+			resolveCameraEvidence(cameraInput).catch(() => ({ ocrText: '', source: null, prompt: '' }))
+		);
 		const hasCameraEvidence = Boolean(cameraEvidence.ocrText || cameraInput.ocr_text || cameraInput.image_data_url || cameraInput.image_base64 || cameraInput.image_url);
 
 		if (!barcode && !hasCameraEvidence) {
-			return json({ error: 'Provide a barcode or a camera image to scan.' }, { status: 400, headers });
+			return respond({ error: 'Provide a barcode or a camera image to scan.' }, 400, 'missing_scan_input');
 		}
 
 		const barcodeValidation = barcode ? validateBarcode(barcode) : { valid: false, type: 'unknown' as const, digits: '', error: 'No barcode provided' };
+
+		// Extra hygiene: ensure barcode digits are sane length
+		if (barcode && barcodeValidation.valid === false && barcode.replace(/\D/g, '').length > 20) {
+			return respond({ error: 'Barcode too long' }, 400, 'barcode_too_long');
+		}
+
 		if (barcode && !barcodeValidation.valid && !hasCameraEvidence) {
-			return json(
+			return respond(
 				{
 					error: barcodeValidation.error || `Invalid barcode: ${barcodeValidation.type}`,
 					barcode_validation: barcodeValidation
 				},
-				{ status: 400, headers }
+				400,
+				'invalid_barcode'
 			);
 		}
 
+		// Prefer Authorization header over cookies (consistent with hardened auth)
 		let userId: string | null = null;
 		const authHeader = request.headers.get('authorization') || '';
 		if (authHeader.startsWith('Bearer ')) {
 			const token = authHeader.slice(7).trim();
 			if (token) {
 				try {
-					const adminSupabase = getAdminSupabase() as unknown as {
-						auth: {
-							getUser: (jwt: string) => Promise<{ data: { user: { id: string } | null }; error: unknown }>;
-						};
-					};
-					const { data } = await adminSupabase.auth.getUser(token);
-					userId = data.user?.id || null;
+					// Use JWT verification (same as /api/history) instead of admin token lookup
+					const user = await measureStage('auth_verify', () => Promise.resolve(verifyJwt(token)));
+					if (user) {
+						userId = user.id;
+					}
 				} catch {
 					userId = null;
 				}
@@ -4196,23 +4349,26 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 
 		if (userId) {
-			const quota = await checkAndDecrementQuota(userId);
+			const quota = await measureStage('quota_check', () => checkAndDecrementQuota(userId));
 			if (!quota.allowed) {
-				return json(
+				return respond(
 					{ error: quota.reason || 'Scan quota exceeded.', quota: { plan: quota.plan, scansRemaining: quota.scansRemaining } },
-					{ status: 402, headers }
+					402,
+					'quota_exceeded'
 				);
 			}
 		}
 
-		const result = await withTimeout(
-			robustScan(barcode || '', cameraInput),
-			20_000,
-			{
-				...fallbackCorporateResult(barcode || cameraEvidence.ocrText || 'camera'),
-				error: 'Scan timed out. Please try again.',
-				arbitration_log: 'Hard timeout reached in POST handler.'
-			} as OpenRouterCorporateOutput
+		const result = await measureStage('robust_scan', () =>
+			withTimeout(
+				robustScan(barcode || '', cameraInput),
+				20_000,
+				{
+					...fallbackCorporateResult(barcode || cameraEvidence.ocrText || 'camera'),
+					error: 'Scan timed out. Please try again.',
+					arbitration_log: 'Hard timeout reached in POST handler.'
+				} as OpenRouterCorporateOutput
+			)
 		);
 
 		const needsCameraFallback =
@@ -4233,13 +4389,38 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 
 		if (userId) {
-			saveScanHistory(userId, barcode || result.barcode, result).catch(() => null);
+			void measureStage('history_save', () =>
+				Promise.resolve(saveScanHistory(userId, barcode || result.barcode, result).catch(() => null))
+			);
 		}
 
-		return json(result, { headers });
-	} catch (error) {
-		const message = error instanceof Error ? error.message : 'Internal server error';
-		console.error('[verify] POST failed', error);
-		return json({ error: message }, { status: 500, headers });
+		return respond(result, 200, 'success');
+	} catch (_error) {
+		finalStatus = 500;
+		finalOutcome = 'error';
+		finalError = _error;
+		return json({ error: 'Internal server error' }, { status: 500, headers });
+	} finally {
+		const durationMs = Number((performance.now() - requestStartedAt).toFixed(2));
+		const context = {
+			status: finalStatus,
+			durationMs,
+			details: {
+				outcome: finalOutcome,
+				stages: stageTimings
+			}
+		};
+
+		if (finalError) {
+			logger.error('scan request completed', finalError, context);
+		} else {
+			logger.info('scan request completed', context);
+		}
 	}
 };
+
+// Validate that ALLOWED_ORIGINS is configured
+if (typeof ALLOWED_ORIGINS === 'undefined' || ALLOWED_ORIGINS.size === 0) {
+	scanWarnLog('⚠️  WARNING: ALLOWED_ORIGINS is empty or undefined. CORS will reject all origins except https://localhost');
+}
+

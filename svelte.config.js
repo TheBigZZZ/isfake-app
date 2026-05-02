@@ -7,6 +7,11 @@ const config = {
 		runes: ({ filename }) => (filename.split(/[/\\]/).includes('node_modules') ? undefined : true)
 	},
 	kit: {
+		experimental: {
+			instrumentation: {
+				server: true
+			}
+		},
 		adapter: adapter({ out: 'build' })
 	}
 };

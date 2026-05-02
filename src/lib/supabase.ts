@@ -6,7 +6,34 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://placeholder.su
 const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'public-anon-key';
 const verifyApiUrl = import.meta.env.VITE_VERIFY_API_URL?.replace(/\/$/, '') || '/api/scan';
 
-export const supabase = createClient(supabaseUrl, supabaseKey);
+export const supabase = createClient(supabaseUrl, supabaseKey, {
+	auth: {
+		persistSession: true,
+		autoRefreshToken: true,
+		detectSessionInUrl: true
+	}
+});
+
+function getAuthRedirectUrl(path: string) {
+	if (typeof window === 'undefined') {
+		return path;
+	}
+
+	return new URL(path, window.location.origin).toString();
+}
+
+export async function signInWithGoogle() {
+	return supabase.auth.signInWithOAuth({
+		provider: 'google',
+		options: {
+			redirectTo: getAuthRedirectUrl('/auth/callback'),
+			queryParams: {
+				access_type: 'offline',
+				prompt: 'consent'
+			}
+		}
+	});
+}
 
 type ScanRequestBody = {
 	barcode?: string;
