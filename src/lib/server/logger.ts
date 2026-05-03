@@ -9,10 +9,11 @@ type LogContext = {
 	error?: unknown;
 };
 
-const SENSITIVE_KEY_PATTERN = /(authorization|cookie|set-cookie|token|secret|password|api[-_]?key)/i;
+const SENSITIVE_KEY_PATTERN =
+	/(authorization|cookie|set-cookie|token|secret|password|api[-_]?key)/i;
 const MAX_LOG_STRING_LENGTH = 240;
 
-import * as Sentry from '@sentry/sveltekit';
+import * as Sentry from '@sentry/node';
 
 const sentryEnabled = Boolean(process.env.SENTRY_DSN);
 
@@ -30,7 +31,13 @@ export function createServerLogger(route: string, requestId?: string) {
 	};
 }
 
-function writeLog(level: LogLevel, route: string, requestId: string | undefined, message: string, context: LogContext) {
+function writeLog(
+	level: LogLevel,
+	route: string,
+	requestId: string | undefined,
+	message: string,
+	context: LogContext
+) {
 	const entry = {
 		level,
 		timestamp: new Date().toISOString(),
@@ -71,9 +78,9 @@ function sanitizeContext(context: LogContext) {
 		output.error =
 			context.error instanceof Error
 				? {
-					name: context.error.name,
-					message: context.error.message
-				  }
+						name: context.error.name,
+						message: context.error.message
+					}
 				: typeof context.error === 'string'
 					? context.error
 					: 'unknown_error';

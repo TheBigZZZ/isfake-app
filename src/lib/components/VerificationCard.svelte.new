@@ -1,13 +1,14 @@
 <script lang="ts">
-  import { createEventDispatcher } from 'svelte';
+  import { createEventDispatcher, onMount } from 'svelte';
   import type { VerificationResult } from '$lib/verification';
 
-  let { result = null, compact = false } = $props<{ result: VerificationResult | null; compact?: boolean }>();
+  export let result: VerificationResult | null = null;
+  export let compact: boolean = false;
 
   const dispatch = createEventDispatcher();
 
-  let expanded = $state(false);
-  let copying = $state(false);
+  let expanded = false;
+  let copying = false;
 
   function getVerifiedName() {
     return result?.product_identity?.verified_name ?? result?.product_name ?? `Unresolved`;
@@ -28,7 +29,7 @@
       copying = true;
       await navigator.clipboard.writeText(result.barcode);
       dispatch('copy:barcode', { barcode: result.barcode });
-    } catch {
+    } catch (e) {
       // ignore
     } finally {
       copying = false;
@@ -43,7 +44,7 @@
     dispatch('retry');
   }
 
-  function isFlagged() { return result ? (result.compliance?.is_flagged ?? result.is_flagged) : false; }
+  $: isFlagged = result ? (result.compliance?.is_flagged ?? result.is_flagged) : false;
 </script>
 
 {#if !result}
@@ -52,7 +53,7 @@
     <div class="vf-loading">Checking product...</div>
   </div>
 {:else}
-  <article class="vf-card" data-variant={compact ? 'compact' : isFlagged() ? 'flagged' : 'clear'}>
+  <article class="vf-card" data-variant={compact ? 'compact' : isFlagged ? 'flagged' : 'clear'}>
     <div class="vf-topbar" aria-hidden="true"></div>
     <header class="vf-header">
       <div class="vf-title">
@@ -60,7 +61,7 @@
         {#if getBrand()}<div class="vf-brand">{getBrand()}</div>{/if}
       </div>
       <div class="vf-actions">
-        <button class="vf-copy" onclick={copyBarcode} aria-label="Copy barcode">
+        <button class="vf-copy" on:click={copyBarcode} aria-label="Copy barcode">
           {#if copying}
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="currentColor"/></svg>
           {:else}
@@ -105,17 +106,17 @@
       <section class="vf-compliance">
         <div class="vf-comp-head">
           <div class="vf-label">Compliance</div>
-          <div class="vf-status" aria-hidden={isFlagged()}>{isFlagged() ? 'Flagged' : 'Clear'}</div>
+          <div class="vf-status" aria-hidden>{isFlagged ? 'Flagged' : 'Clear'}</div>
         </div>
         {#if (result.compliance?.flag_reason ?? result.flag_reason)}
           <div class="vf-flag-reason">{result.compliance?.flag_reason ?? result.flag_reason}</div>
         {/if}
 
         <div class="vf-arb">
-          <button class="vf-disclosure" aria-expanded={expanded} onclick={toggleExpand}>
+          <button class="vf-disclosure" aria-expanded={expanded} on:click={toggleExpand}>
             {expanded ? 'Hide full analysis' : 'Show full analysis'}
           </button>
-          <div class="vf-arb-body" hidden={!expanded} aria-hidden={!expanded}>
+          <div class="vf-arb-body" hidden={!expanded} aria-hidden={!expanded} tabindex={expanded ? 0 : -1}>
             <pre class="vf-reason">{result.arbitration_log ?? result.reasoning ?? 'No detailed reasoning available.'}</pre>
           </div>
         </div>
@@ -125,7 +126,7 @@
     {#if result.error}
       <div class="vf-error">
         <div class="vf-error-msg">{result.error}</div>
-        <button class="vf-retry" onclick={onRetry}>Retry</button>
+        <button class="vf-retry" on:click={onRetry}>Retry</button>
       </div>
     {/if}
   </article>
