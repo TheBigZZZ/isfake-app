@@ -79,3 +79,30 @@ export async function verifyBarcode(barcode: string) {
 export async function verifyScan(barcode?: string, extras: Omit<ScanRequestBody, 'barcode' | 'action'> = {}) {
 	return postVerificationRequest({ ...(barcode ? { barcode } : {}), action: 'scan', ...extras });
 }
+
+export async function fetchRecentIdentifications() {
+	try {
+		const { data: { user } } = await supabase.auth.getUser();
+		if (!user) return [];
+
+		const { data, error } = await supabase
+			.from('scans')
+			.select('id, product_name, status, created_at')
+			.eq('user_id', user.id)
+			.order('created_at', { ascending: false })
+			.limit(10);
+
+		if (error) {
+			console.error('Failed to fetch recent identifications:', error);
+			return [];
+		}
+
+		return (data || []).map((item: any) => ({
+			...item,
+			timestamp: item.created_at
+		}));
+	} catch (error) {
+		console.error('Error fetching recent identifications:', error);
+		return [];
+	}
+}

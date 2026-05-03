@@ -1,16 +1,17 @@
 <script lang="ts">
-  import { createEventDispatcher } from 'svelte';
   import type { VerificationResult } from '$lib/verification';
 
-  let { result = null, compact = false } = $props<{ result: VerificationResult | null; compact?: boolean }>();
+  interface Props {
+    result?: VerificationResult | null;
+  }
 
-  const dispatch = createEventDispatcher();
+  let { result = null }: Props = $props();
 
   let expanded = $state(false);
   let copying = $state(false);
 
   function getVerifiedName() {
-    return result?.product_identity?.verified_name ?? result?.product_name ?? `Unresolved`;
+    return result?.product_identity?.verified_name ?? result?.product_name ?? 'Unknown Product';
   }
 
   function getBrand() {
@@ -22,175 +23,478 @@
     return Math.round(score * 100);
   }
 
+  function isFlagged() {
+    return result ? (result.compliance?.is_flagged ?? result.is_flagged) : false;
+  }
+
   async function copyBarcode() {
     if (!result?.barcode) return;
     try {
       copying = true;
       await navigator.clipboard.writeText(result.barcode);
-      dispatch('copy:barcode', { barcode: result.barcode });
     } catch {
       // ignore
     } finally {
       copying = false;
     }
   }
-
-  function toggleExpand() {
-    expanded = !expanded;
-  }
-
-  function onRetry() {
-    dispatch('retry');
-  }
-
-  function isFlagged() { return result ? (result.compliance?.is_flagged ?? result.is_flagged) : false; }
 </script>
 
-{#if !result}
-  <div class="vf-card empty" role="status" aria-live="polite">
-    <div class="vf-spinner" aria-hidden="true"></div>
-    <div class="vf-loading">Checking product...</div>
-  </div>
-{:else}
-  <article class="vf-card" data-variant={compact ? 'compact' : isFlagged() ? 'flagged' : 'clear'}>
-    <div class="vf-topbar" aria-hidden="true"></div>
-    <header class="vf-header">
-      <div class="vf-title">
-        <h3 class="vf-name">{getVerifiedName()}</h3>
-        {#if getBrand()}<div class="vf-brand">{getBrand()}</div>{/if}
+<div class="verification-card">
+  {#if !result}
+    <div class="loading-state">
+      <div class="spinner"></div>
+      <p>Checking product...</p>
+    </div>
+  {:else}
+    <!-- Status Header -->
+    <div class="status-header" class:flagged={isFlagged()} class:clear={!isFlagged()}>
+      <div class="status-badge">
+        {isFlagged() ? '⚠️ FLAGGED' : '✓ CLEAR'}
       </div>
-      <div class="vf-actions">
-        <button class="vf-copy" onclick={copyBarcode} aria-label="Copy barcode">
-          {#if copying}
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="currentColor"/></svg>
-          {:else}
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2" stroke="currentColor" fill="none" stroke-width="1.5"/></svg>
-          {/if}
-        </button>
-        <div class="vf-barcode mono">{result.barcode}</div>
+      <div class="status-label">
+        {isFlagged() ? 'Product flagged for compliance issues' : 'Product verification passed'}
       </div>
-    </header>
+    </div>
 
-    {#if !compact}
-      <section class="vf-metrics">
-        <div class="vf-metric">
-          <div class="vf-label">Category</div>
-          <div class="vf-value">{result.product_identity?.category ?? '—'}</div>
-        </div>
-        <div class="vf-metric">
-          <div class="vf-label">Confidence</div>
-          <div class="vf-value">{confidencePct()}%</div>
-        </div>
-        <div class="vf-metric">
-          <div class="vf-label">Physical origin</div>
-          <div class="vf-value">{result.origin_details?.physical_origin_country ?? result.origin_country ?? '—'}</div>
-        </div>
-        <div class="vf-metric">
-          <div class="vf-label">Legal prefix</div>
-          <div class="vf-value">{result.origin_details?.legal_registration_prefix ?? '—'}</div>
-        </div>
-      </section>
-
-      <section class="vf-corporate">
-        <div class="vf-field">
-          <div class="vf-label">Ultimate parent</div>
-          <div class="vf-value">{result.corporate_structure?.ultimate_parent_company ?? result.parent_company ?? '—'}</div>
-        </div>
-        <div class="vf-field">
-          <div class="vf-label">Parent HQ country</div>
-          <div class="vf-value">{result.corporate_structure?.global_hq_country ?? result.holding_company_hq ?? '—'}</div>
-        </div>
-      </section>
-
-      <section class="vf-compliance">
-        <div class="vf-comp-head">
-          <div class="vf-label">Compliance</div>
-          <div class="vf-status" aria-hidden={isFlagged()}>{isFlagged() ? 'Flagged' : 'Clear'}</div>
-        </div>
-        {#if (result.compliance?.flag_reason ?? result.flag_reason)}
-          <div class="vf-flag-reason">{result.compliance?.flag_reason ?? result.flag_reason}</div>
-        {/if}
-
-        <div class="vf-arb">
-          <button class="vf-disclosure" aria-expanded={expanded} onclick={toggleExpand}>
-            {expanded ? 'Hide full analysis' : 'Show full analysis'}
+    <!-- Product Name -->
+    <div class="product-section">
+      <h2 class="product-name">{getVerifiedName()}</h2>
+      {#if getBrand()}
+        <p class="product-brand">{getBrand()}</p>
+      {/if}
+      {#if result.barcode}
+        <div class="barcode-section">
+          <code class="barcode">{result.barcode}</code>
+          <button
+            onclick={copyBarcode}
+            class="copy-button"
+            title="Copy barcode"
+          >
+            {copying ? '✓ Copied' : '📋 Copy'}
           </button>
-          <div class="vf-arb-body" hidden={!expanded} aria-hidden={!expanded}>
-            <pre class="vf-reason">{result.arbitration_log ?? result.reasoning ?? 'No detailed reasoning available.'}</pre>
+        </div>
+      {/if}
+    </div>
+
+    <!-- Metrics Grid -->
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-label">CATEGORY</div>
+        <div class="metric-value">
+          {result.product_identity?.category ?? '—'}
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">CONFIDENCE</div>
+        <div class="metric-value">
+          {confidencePct()}%
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">PHYSICAL ORIGIN</div>
+        <div class="metric-value">
+          {result.origin_details?.physical_origin_country ?? result.origin_country ?? '—'}
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">LEGAL PREFIX</div>
+        <div class="metric-value">
+          {result.origin_details?.legal_registration_prefix ?? '—'}
+        </div>
+      </div>
+    </div>
+
+    <!-- Corporate Structure -->
+    <div class="corporate-section">
+      <h3 class="section-title">Corporate Structure</h3>
+      <div class="corp-grid">
+        <div class="corp-field">
+          <div class="corp-label">Ultimate Parent Company</div>
+          <div class="corp-value">
+            {result.corporate_structure?.ultimate_parent_company ?? result.parent_company ?? '—'}
           </div>
         </div>
-      </section>
-    {/if}
+        <div class="corp-field">
+          <div class="corp-label">Parent HQ Country</div>
+          <div class="corp-value">
+            {result.corporate_structure?.global_hq_country ?? result.holding_company_hq ?? '—'}
+          </div>
+        </div>
+      </div>
+    </div>
 
+    <!-- Compliance Status -->
+    <div class="compliance-section" class:flagged={isFlagged()}>
+      <div class="compliance-header">
+        <h3 class="section-title">Compliance Status</h3>
+        <span class="compliance-badge" class:flagged={isFlagged()}>
+          {isFlagged() ? 'FLAGGED' : 'CLEAR'}
+        </span>
+      </div>
+      {#if isFlagged() && (result.compliance?.flag_reason ?? result.flag_reason)}
+        <div class="flag-reason">
+          <strong>Reason:</strong> {result.compliance?.flag_reason ?? result.flag_reason}
+        </div>
+      {/if}
+    </div>
+
+    <!-- Arbitration Log (Expandable) -->
+    <div class="arbitration-section">
+      <button
+        onclick={() => (expanded = !expanded)}
+        class="disclosure-button"
+        aria-expanded={expanded}
+      >
+        {expanded ? '▼ Hide' : '▶ Show'} Full Analysis
+      </button>
+      {#if expanded}
+        <div class="arbitration-log">
+          <pre>{result.arbitration_log ?? result.reasoning ?? 'No detailed analysis available.'}</pre>
+        </div>
+      {/if}
+    </div>
+
+    <!-- Error Section -->
     {#if result.error}
-      <div class="vf-error">
-        <div class="vf-error-msg">{result.error}</div>
-        <button class="vf-retry" onclick={onRetry}>Retry</button>
+      <div class="error-section">
+        <p class="error-message">⚠️ {result.error}</p>
+        <button class="retry-button">Retry Verification</button>
       </div>
     {/if}
-  </article>
-{/if}
+  {/if}
+</div>
 
 <style>
-  :global(:root) {
-    --vf-border: var(--border-subtle, #e6e6e6);
-    --vf-accent: var(--accent-color, highlight);
-    --vf-radius: 12px;
-    --vf-gap: 12px;
+  .verification-card {
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 24px;
+    max-width: 100%;
+    font-family: 'Inter', sans-serif;
+    color: #1f2937;
+    line-height: 1.6;
   }
 
-  .vf-card {
-    border: 1px solid var(--vf-border);
-    border-radius: var(--vf-radius);
-    padding: 12px;
-    background: var(--card-bg, transparent);
-    box-shadow: 0 6px 18px rgba(0,0,0,0.04);
+  .loading-state {
     display: flex;
     flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 60px 20px;
+    gap: 16px;
+  }
+
+  .spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid #e5e7eb;
+    border-top-color: #0058be;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  /* Status Header */
+  .status-header {
+    padding: 16px;
+    border-radius: 8px;
+    margin-bottom: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .status-header.flagged {
+    background-color: #fff7ed;
+    border: 1px solid #fed7aa;
+  }
+
+  .status-header.clear {
+    background-color: #f0fdf4;
+    border: 1px solid #bbf7d0;
+  }
+
+  .status-badge {
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 0.05em;
+  }
+
+  .status-header.flagged .status-badge {
+    color: #b45309;
+  }
+
+  .status-header.clear .status-badge {
+    color: #166534;
+  }
+
+  .status-label {
+    font-size: 13px;
+    opacity: 0.8;
+  }
+
+  /* Product Section */
+  .product-section {
+    margin-bottom: 28px;
+  }
+
+  .product-name {
+    margin: 0 0 8px 0;
+    font-size: 28px;
+    font-weight: 700;
+    line-height: 1.2;
+    color: #0f172a;
+    font-family: 'Manrope', sans-serif;
+  }
+
+  .product-brand {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    color: #6b7280;
+  }
+
+  .barcode-section {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    padding: 8px 12px;
+    background-color: #f9fafb;
+    border-radius: 6px;
+  }
+
+  .barcode {
+    font-family: 'Space Grotesk', monospace;
+    font-size: 12px;
+    color: #6b7280;
+    margin: 0;
+  }
+
+  .copy-button {
+    margin-left: auto;
+    padding: 4px 8px;
+    background: none;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .copy-button:hover {
+    background-color: #f3f4f6;
+    border-color: #0058be;
+    color: #0058be;
+  }
+
+  /* Metrics Grid */
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+    margin-bottom: 28px;
+  }
+
+  .metric-card {
+    padding: 12px;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    background-color: #fafbfc;
+  }
+
+  .metric-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: #6b7280;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .metric-value {
+    font-size: 16px;
+    font-weight: 600;
+    color: #0f172a;
+  }
+
+  /* Corporate Structure */
+  .corporate-section {
+    margin-bottom: 28px;
+    padding-bottom: 28px;
+    border-bottom: 1px solid #e5e7eb;
+  }
+
+  .section-title {
+    margin: 0 0 16px 0;
+    font-size: 16px;
+    font-weight: 700;
+    color: #0f172a;
+    font-family: 'Manrope', sans-serif;
+  }
+
+  .corp-grid {
+    display: grid;
+    grid-template-columns: 1fr;
     gap: 12px;
   }
 
-  .vf-topbar { height: 4px; border-radius: 4px; background: linear-gradient(90deg, transparent, var(--vf-accent)); }
-
-  .vf-header { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
-  .vf-name { margin:0; font-size:1.25rem; line-height:1.1; }
-  .vf-brand { font-size:0.9rem; color:var(--muted, #6b7280); }
-
-  .vf-actions { display:flex; align-items:center; gap:8px; }
-  .vf-copy { background:transparent; border:0; padding:6px; cursor:pointer; }
-  .vf-copy .icon { width:18px; height:18px; }
-
-  .vf-barcode { font-family: ui-monospace, SFMono-Regular, menlo, monospace; font-size:0.8rem; color:var(--muted); }
-
-  .vf-metrics { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
-  .vf-metric { border:1px solid var(--vf-border); padding:8px; border-radius:8px; }
-  .vf-label { font-size:0.72rem; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted); }
-  .vf-value { margin-top:6px; font-size:0.95rem; }
-
-  .vf-corporate { display:flex; flex-direction:column; gap:8px; }
-  .vf-field { border:1px solid var(--vf-border); padding:10px; border-radius:8px; }
-
-  .vf-compliance { border-top:1px dashed var(--vf-border); padding-top:8px; }
-  .vf-comp-head { display:flex; justify-content:space-between; align-items:center; }
-  .vf-status { font-weight:600; }
-
-  .vf-flag-reason { margin-top:8px; color:var(--muted); }
-  .vf-disclosure { background:transparent; border:0; color:inherit; padding:6px 0; cursor:pointer; }
-  .vf-arb-body { margin-top:8px; max-height:320px; overflow:auto; border:1px solid var(--vf-border); padding:8px; border-radius:8px; }
-  .vf-reason { white-space:pre-wrap; font-family:inherit; font-size:0.9rem; margin:0; }
-
-  .vf-error { border-top:1px solid var(--vf-border); padding-top:8px; display:flex; gap:8px; align-items:center; }
-  .vf-retry { margin-left:auto; }
-
-  .vf-card[data-variant='compact'] { padding:10px; }
-
-  @media (max-width:600px) {
-    .vf-metrics { grid-template-columns:1fr; }
-    .vf-header { flex-direction:column; align-items:stretch; }
-    .vf-actions { justify-content:space-between; }
+  .corp-field {
+    padding: 12px;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    background-color: #fafbfc;
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    * { transition: none !important; }
+  .corp-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: #6b7280;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .corp-value {
+    font-size: 14px;
+    color: #0f172a;
+  }
+
+  /* Compliance Status */
+  .compliance-section {
+    margin-bottom: 28px;
+    padding: 16px;
+    border-radius: 8px;
+    background-color: #f9fafb;
+  }
+
+  .compliance-section.flagged {
+    background-color: #fff7ed;
+    border: 1px solid #fed7aa;
+  }
+
+  .compliance-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+
+  .compliance-badge {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    padding: 6px 12px;
+    border-radius: 6px;
+    background-color: #dbeafe;
+    color: #0c4a6e;
+  }
+
+  .compliance-badge.flagged {
+    background-color: #fed7aa;
+    color: #b45309;
+  }
+
+  .flag-reason {
+    font-size: 14px;
+    color: #6b7280;
+    line-height: 1.6;
+  }
+
+  /* Arbitration Log */
+  .arbitration-section {
+    margin-bottom: 28px;
+    border-top: 1px solid #e5e7eb;
+    padding-top: 20px;
+  }
+
+  .disclosure-button {
+    background: none;
+    border: none;
+    padding: 8px 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: #0058be;
+    cursor: pointer;
+    transition: color 0.2s;
+  }
+
+  .disclosure-button:hover {
+    color: #0041a8;
+  }
+
+  .arbitration-log {
+    margin-top: 12px;
+    padding: 12px;
+    background-color: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    max-height: 400px;
+    overflow-y: auto;
+  }
+
+  .arbitration-log pre {
+    margin: 0;
+    font-family: 'Space Grotesk', monospace;
+    font-size: 12px;
+    color: #6b7280;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* Error Section */
+  .error-section {
+    margin-top: 20px;
+    padding: 16px;
+    background-color: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .error-message {
+    margin: 0;
+    flex: 1;
+    font-size: 14px;
+    color: #991b1b;
+  }
+
+  .retry-button {
+    padding: 8px 16px;
+    background-color: #ef4444;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 0.2s;
+  }
+
+  .retry-button:hover {
+    background-color: #dc2626;
+  }
+
+  @media (max-width: 640px) {
+    .verification-card {
+      padding: 16px;
+    }
+
+    .metrics-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .product-name {
+      font-size: 24px;
+    }
   }
 </style>
