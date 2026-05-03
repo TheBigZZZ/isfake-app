@@ -50,7 +50,7 @@ export function extractJwtFromRequest(request: Request): string | null {
 export function verifyJwt(token: string): AuthUser | null {
 	try {
 		if (!SUPABASE_JWT_SECRET) {
-			createServerLogger('lib.auth').error('SUPABASE_JWT_SECRET not configured');
+			createServerLogger('lib.auth').error('SUPABASE_JWT_SECRET not configured', new Error('missing_jwt_secret'));
 			return null;
 		}
 

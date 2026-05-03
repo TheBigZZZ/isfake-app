@@ -39,7 +39,7 @@ export default defineConfig(
 	{
 		// Server-side rules: disallow console.* except inside the logger implementation
 		files: ['src/lib/server/**', 'src/routes/api/**'],
-		excludedFiles: ['src/lib/server/logger.ts'],
+		ignores: ['src/lib/server/logger.ts'],
 		rules: {
 			'no-console': 'error'
 		}

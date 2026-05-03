@@ -96,7 +96,10 @@ export const POST: RequestHandler = async ({ request }) => {
 
 		// Create user record in public.users table (will have proper types once migrations applied)
 		try {
-			await (adminSupabase.from('users') as any).insert([
+			const usersTable = adminSupabase.from('users') as unknown as {
+				insert: (rows: Array<Record<string, unknown>>) => Promise<unknown>;
+			};
+			await usersTable.insert([
 				{
 					id: createdUser.user.id,
 					email: email,
@@ -109,7 +112,10 @@ export const POST: RequestHandler = async ({ request }) => {
 
 		// Create initial quota record for today
 		try {
-			await (adminSupabase.from('quotas') as any).insert([
+			const quotasTable = adminSupabase.from('quotas') as unknown as {
+				insert: (rows: Array<Record<string, unknown>>) => Promise<unknown>;
+			};
+			await quotasTable.insert([
 				{
 					user_id: createdUser.user.id,
 					scans_used: 0,

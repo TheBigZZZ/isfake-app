@@ -41,12 +41,18 @@ export const GET: RequestHandler = async ({ request, url }) => {
 		const adminSupabase = getAdminSupabase();
 
 		// Get scan history with count
-		const { data: scans, error: scanError, count } = await (adminSupabase
+		const historyQuery = adminSupabase
 			.from('scan_history')
 			.select('id, barcode, result, created_at', { count: 'exact' })
 			.eq('user_id', user.id)
 			.order('created_at', { ascending: false })
-			.range(offset, offset + limit - 1)) as any;
+			.range(offset, offset + limit - 1);
+
+		const { data: scans, error: scanError, count } = (await historyQuery) as unknown as {
+			data: Array<Record<string, unknown>> | null;
+			error: unknown;
+			count: number | null;
+		};
 
 		if (scanError) {
 			Sentry.captureException(scanError, { tags: { context: 'history_fetch' } });

@@ -14,10 +14,15 @@ export type QuotaCheckResult = {
  */
 export async function checkAndDecrementQuota(userId: string): Promise<QuotaCheckResult> {
 	try {
-		const adminSupabase = getAdminSupabase();
+		const adminSupabase = getAdminSupabase() as unknown as {
+			rpc: (
+				fn: string,
+				args: Record<string, unknown>
+			) => Promise<{ data: { allowed: boolean; scans_remaining: number } | null; error: unknown }>;
+		};
 
 		// Call the increment_quota_usage RPC function
-		const { data, error } = await (adminSupabase.rpc as any)('increment_quota_usage', {
+		const { data, error } = await adminSupabase.rpc('increment_quota_usage', {
 			p_user_id: userId
 		});
 
@@ -49,9 +54,14 @@ export async function checkAndDecrementQuota(userId: string): Promise<QuotaCheck
  */
 export async function getUserQuota(userId: string) {
 	try {
-		const adminSupabase = getAdminSupabase();
+		const adminSupabase = getAdminSupabase() as unknown as {
+			rpc: (
+				fn: string,
+				args: Record<string, unknown>
+			) => Promise<{ data: { allowed: boolean; scans_remaining: number; plan?: string } | null; error: unknown }>;
+		};
 
-		const { data, error } = await (adminSupabase.rpc as any)('check_user_quota', {
+		const { data, error } = await adminSupabase.rpc('check_user_quota', {
 			p_user_id: userId
 		});
 

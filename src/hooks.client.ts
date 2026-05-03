@@ -7,7 +7,6 @@ if (dsn) {
 		dsn,
 		environment: import.meta.env.MODE,
 		tracesSampleRate: 0,
-		integrations: [Sentry.consoleIntegration()],
 		sendDefaultPii: false
 	});
 }
@@ -15,5 +14,6 @@ if (dsn) {
 export const init = () => {};
 
 export const handleError = Sentry.handleErrorWithSentry(({ error, event }: { error: unknown; event: unknown }) => {
-	console.error('An error occurred on the client side:', error, event);
+	// Error context is already captured by Sentry.handleErrorWithSentry()
+	// Avoid console.* to prevent duplicate/noisy logging
 });

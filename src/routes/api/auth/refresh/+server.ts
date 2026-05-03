@@ -37,7 +37,7 @@ export const POST: RequestHandler = async ({ request, cookies }) => {
 		// Use the refresh token to get a new session
 		const { data, error } = await adminSupabase.auth.refreshSession({
 			refresh_token: refreshToken
-		} as any);
+		});
 
 		if (error || !data.session) {
 			Sentry.captureException(error || new Error('Session refresh failed'), {

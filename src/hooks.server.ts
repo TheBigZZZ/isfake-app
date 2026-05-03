@@ -48,6 +48,36 @@ const requestIdHandle: Handle = async ({ event, resolve }) => {
 	});
 
 	response.headers.set('x-request-id', requestId);
+
+	// Security headers
+	response.headers.set('X-Content-Type-Options', 'nosniff');
+	response.headers.set('X-Frame-Options', 'DENY');
+	response.headers.set('X-XSS-Protection', '1; mode=block');
+	response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+	response.headers.set('Permissions-Policy', 'accelerometer=(), camera=(), microphone=(), geolocation=(), magnetometer=(), payment=(), usb=()');
+	
+	// Strict-Transport-Security (HSTS) — enable in production
+	if (env.NODE_ENV === 'production') {
+		response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+	}
+
+	// Content Security Policy (permissive for Capacitor/mobile compatibility)
+	const csp = [
+		"default-src 'self'",
+		"script-src 'self' 'unsafe-inline' 'unsafe-eval' capacitor://", // unsafe-eval needed for Svelte
+		"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+		"font-src 'self' https://fonts.gstatic.com data:",
+		"img-src 'self' data: https:",
+		"connect-src 'self' https://accounts.google.com https://*.supabase.co wss://*.supabase.co https://*.openrouter.ai https://*.upstash.io https://sentry.io",
+		"frame-src 'self' https://accounts.google.com",
+		"media-src 'self' blob:",
+		"object-src 'none'",
+		"base-uri 'self'",
+		"form-action 'self'",
+		"frame-ancestors 'none'"
+	].join('; ');
+	response.headers.set('Content-Security-Policy', csp);
+
 	return response;
 };
 
