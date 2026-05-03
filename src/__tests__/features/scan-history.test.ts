@@ -165,11 +165,9 @@ describe('Scan History: Cache Operations', () => {
  * Test Suite: Cache Expiration
  */
 describe('Scan History: Cache Expiration', () => {
-	let cache: ScanCache;
 	let mockResult: ScanResult;
 
 	beforeEach(() => {
-		cache = new ScanCache();
 		mockResult = {
 			id: 'scan-1',
 			user_id: 'user-123',

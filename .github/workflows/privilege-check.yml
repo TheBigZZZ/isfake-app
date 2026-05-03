@@ -1,8 +1,12 @@
 name: Supabase Privilege Check
 
 on:
-  workflow_dispatch: {}
-  pull_request: {}
+  workflow_dispatch:
+    inputs:
+      pg_connection_string:
+        description: 'Postgres connection string'
+        required: true
+        type: string
 
 jobs:
   run-privilege-check:
@@ -22,6 +26,6 @@ jobs:
 
       - name: Run privilege check
         env:
-          PG_CONNECTION_STRING: ${{ secrets.PG_CONNECTION_STRING }}
+          PG_CONNECTION_STRING: ${{ github.event.inputs.pg_connection_string }}
         run: |
           node scripts/run_privilege_check.js

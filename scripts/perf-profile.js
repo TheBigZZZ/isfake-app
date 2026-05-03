@@ -18,7 +18,6 @@ async function hit(url, options){
   const t0 = performance.now();
   try{
     const r = await fetch(url, options);
-    const text = await (r.headers.get('content-type') || '').includes('json') ? r.json().catch(()=>null) : r.text().catch(()=>null);
     const t1 = performance.now();
     return { ok: r.ok, status: r.status, dur: t1-t0 };
   }catch(e){
