@@ -2,7 +2,7 @@ import type { Handle, HandleServerError } from '@sveltejs/kit';
 import { sequence } from '@sveltejs/kit/hooks';
 import { env } from '$env/dynamic/private';
 import { getRequestId } from '$lib/server/env';
-import * as Sentry from '@sentry/sveltekit';
+import * as Sentry from '@sentry/node';
 
 if (env.SENTRY_DSN) {
 	Sentry.init({
@@ -34,6 +34,7 @@ if (env.SENTRY_DSN) {
 			return event;
 		}
 	});
+
 }
 
 const requestIdHandle: Handle = async ({ event, resolve }) => {
@@ -55,7 +56,7 @@ const requestIdHandle: Handle = async ({ event, resolve }) => {
 	response.headers.set('X-XSS-Protection', '1; mode=block');
 	response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
 	response.headers.set('Permissions-Policy', 'accelerometer=(), camera=(), microphone=(), geolocation=(), magnetometer=(), payment=(), usb=()');
-	
+
 	// Strict-Transport-Security (HSTS) — enable in production
 	if (env.NODE_ENV === 'production') {
 		response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
@@ -81,8 +82,13 @@ const requestIdHandle: Handle = async ({ event, resolve }) => {
 	return response;
 };
 
-export const handle = sequence(Sentry.sentryHandle(), requestIdHandle);
+export const handle = sequence(requestIdHandle);
 
-export const handleError: HandleServerError = Sentry.handleErrorWithSentry(() => {
+export const handleError: HandleServerError = ({ error }) => {
+	try {
+		Sentry.captureException(error);
+	} catch {
+		// swallow Sentry errors
+	}
 	return { message: 'Internal Server Error' };
-});
+};
