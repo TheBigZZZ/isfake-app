@@ -1,5 +1,5 @@
 import { getAdminSupabase } from '$lib/server/supabase';
-import * as Sentry from '@sentry/sveltekit';
+import * as Sentry from '@sentry/node';
 import { createServerLogger } from '$lib/server/logger';
 
 export type QuotaCheckResult = {

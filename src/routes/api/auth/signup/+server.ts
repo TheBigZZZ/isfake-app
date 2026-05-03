@@ -1,7 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { getAdminSupabase } from '$lib/server/supabase';
-import * as Sentry from '@sentry/sveltekit';
+import * as Sentry from '@sentry/node';
 import { checkAuthSignupRateLimit } from '$lib/server/rate-limit';
 import { createServerLogger } from '$lib/server/logger';
 import { z } from 'zod';

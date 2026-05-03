@@ -1,5 +1,5 @@
 import { env } from '$env/dynamic/private';
-import * as Sentry from '@sentry/sveltekit';
+import * as Sentry from '@sentry/node';
 
 if (env.SENTRY_DSN) {
 	Sentry.init({

@@ -2,7 +2,7 @@ import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { getAdminSupabase } from '$lib/server/supabase';
 import { verifyJwt } from '$lib/server/auth';
-import * as Sentry from '@sentry/sveltekit';
+import * as Sentry from '@sentry/node';
 import { createServerLogger } from '$lib/server/logger';
 
 function parseBoundedInt(value: string | null, fallback: number, min: number, max: number) {

@@ -14,6 +14,21 @@ for (const file of files) {
 	if (!file.endsWith('.js')) continue;
 	const filePath = join(chunksDir, file);
 	let content = readFileSync(filePath, 'utf8');
+	
+	// Fix Sentry ESM/CJS interop: convert `import require$$X__default from '@sentry/node'` to named import
+	// This happens because Vite thinks @sentry/node is CommonJS but it's actually ESM
+	if (content.includes("from '@sentry/node'")) {
+		// Find all Sentry interop imports and convert them
+		content = content.replace(
+			/import\s+require\$\$\d+__default\s+from\s+['"]@sentry\/node['"]/g,
+			"import * as sentryNode from '@sentry/node'"
+		);
+		// Also replace usage patterns like require$$1__default.init() with sentryNode.init()
+		content = content.replace(/require\$\$\d+__default/g, 'sentryNode');
+		writeFileSync(filePath, content, 'utf8');
+		console.log('Fixed Sentry interop in', filePath);
+	}
+	
 	if (content.includes("createRequire") || content.includes("// patched-require-shim")) continue;
 	// If the chunk contains top-level require calls, inject a shim
 	if (/\n\s*require\(/.test(content) || /\n\s*module\.exports\s*=/.test(content)) {
@@ -51,3 +66,4 @@ for (const r of requires) {
 		console.error('Failed to write bridge module', target, e.message);
 	}
 }
+

@@ -2,7 +2,7 @@ import { json } from '@sveltejs/kit';
 import { dev } from '$app/environment';
 import type { RequestHandler } from './$types';
 import { getAdminSupabase } from '$lib/server/supabase';
-import * as Sentry from '@sentry/sveltekit';
+import * as Sentry from '@sentry/node';
 import { createServerLogger } from '$lib/server/logger';
 
 type RefreshRequest = {

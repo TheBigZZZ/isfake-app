@@ -1,5 +1,5 @@
 import { env } from '$env/dynamic/private';
-import * as Sentry from '@sentry/sveltekit';
+import * as Sentry from '@sentry/node';
 import { createServerLogger } from '$lib/server/logger';
 import type { RequestEvent } from '@sveltejs/kit';
 import jwt from 'jsonwebtoken';
